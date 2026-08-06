@@ -364,7 +364,7 @@ def map_single_read(
     strand = "+" if hit.strand == 1 else "-"
     query_seq = sequence if hit.strand == 1 else mappy.revcomp(sequence)
     query_qual = quality if quality is None else (quality if hit.strand == 1 else quality[::-1])
-    cigar_tuples = _cigar_tuples_from_mappy(hit)
+    cigar_tuples = cigar_tuples = _cigar_tuples_from_mappy(hit, len(query_seq))
     cigar_string = "".join(f"{length}{'MIDNSHP=X'[op]}" for op, length in cigar_tuples)
 
     ref_fasta = pysam.FastaFile(str(reference_fasta))
@@ -372,7 +372,10 @@ def map_single_read(
     ref_fasta.close()
 
     aligned_query = query_seq[hit.q_st:hit.q_en]
-    md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, aligned_query, 0, cigar_tuples)
+
+    #md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, aligned_query, 0, cigar_tuples)
+    
+    md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, query_seq, 0, cigar_tuples)
 
     mismatches = []
     for m in raw_mismatches:
