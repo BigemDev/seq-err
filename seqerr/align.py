@@ -48,9 +48,19 @@ def _looks_gzipped(path: Path) -> bool:
         return fh.read(2) == b"\x1f\x8b"
 
 
-def _cigar_tuples_from_mappy(hit) -> list[tuple[int, int]]:
-    return [(op, length) for length, op in hit.cigar]
+def _cigar_tuples_from_mappy(hit, query_len) -> list[tuple[int, int]]:
+    cigar = []
 
+    if hit.q_st > 0:
+        cigar.append((4, hit.q_st))
+
+    cigar.extend((op, length) for length, op in hit.cigar)
+
+    tail = query_len - hit.q_en
+    if tail > 0:
+        cigar.append((4, tail))
+
+    return cigar
 
 def _build_md_nm_mismatches(
     ref_seq: str, read_seq: str, ref_start: int, cigar: list[tuple[int, int]]
@@ -153,9 +163,10 @@ def map_reads_to_bam(
             a.reference_id = bam_out.get_tid(hit.ctg)
             a.reference_start = hit.r_st
             a.mapping_quality = hit.mapq
-            a.cigar = _cigar_tuples_from_mappy(hit)
 
             query_seq = seq if hit.strand == 1 else mappy.revcomp(seq)
+            a.cigar = _cigar_tuples_from_mappy(hit, len(query_seq))
+
             a.query_sequence = query_seq
             if qual:
                 q = qual if hit.strand == 1 else qual[::-1]
@@ -164,8 +175,9 @@ def map_reads_to_bam(
                 a.query_qualities = [30] * len(query_seq)  # no qualities
 
             ref_region = ref_fasta.fetch(hit.ctg, hit.r_st, hit.r_en)
-            md, nm = _build_md_and_nm(ref_region, query_seq[hit.q_st:hit.q_en],
-                                       0, a.cigar)
+           
+            md, nm = _build_md_and_nm(ref_region, query_seq, 0, a.cigar)
+
             a.set_tag("MD", md)
             a.set_tag("NM", nm)
             if technology_tag:
@@ -199,9 +211,10 @@ def _build_segment(bam_out, aligner, ref_fasta, name, seq, qual, hit, technology
     a.reference_id = bam_out.get_tid(hit.ctg)
     a.reference_start = hit.r_st
     a.mapping_quality = hit.mapq
-    a.cigar = _cigar_tuples_from_mappy(hit)
 
     query_seq = seq if hit.strand == 1 else mappy.revcomp(seq)
+    a.cigar = _cigar_tuples_from_mappy(hit, len(query_seq))
+
     a.query_sequence = query_seq
     if qual:
         q = qual if hit.strand == 1 else qual[::-1]
@@ -210,7 +223,7 @@ def _build_segment(bam_out, aligner, ref_fasta, name, seq, qual, hit, technology
         a.query_qualities = [30] * len(query_seq)
 
     ref_region = ref_fasta.fetch(hit.ctg, hit.r_st, hit.r_en)
-    md, nm = _build_md_and_nm(ref_region, query_seq[hit.q_st:hit.q_en], 0, a.cigar)
+    md, nm = _build_md_and_nm(ref_region, query_seq, 0, a.cigar)
     a.set_tag("MD", md)
     a.set_tag("NM", nm)
     if technology_tag:
@@ -351,7 +364,7 @@ def map_single_read(
     strand = "+" if hit.strand == 1 else "-"
     query_seq = sequence if hit.strand == 1 else mappy.revcomp(sequence)
     query_qual = quality if quality is None else (quality if hit.strand == 1 else quality[::-1])
-    cigar_tuples = _cigar_tuples_from_mappy(hit)
+    cigar_tuples = cigar_tuples = _cigar_tuples_from_mappy(hit, len(query_seq))
     cigar_string = "".join(f"{length}{'MIDNSHP=X'[op]}" for op, length in cigar_tuples)
 
     ref_fasta = pysam.FastaFile(str(reference_fasta))
@@ -359,7 +372,10 @@ def map_single_read(
     ref_fasta.close()
 
     aligned_query = query_seq[hit.q_st:hit.q_en]
-    md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, aligned_query, 0, cigar_tuples)
+
+    #md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, aligned_query, 0, cigar_tuples)
+    
+    md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, query_seq, 0, cigar_tuples)
 
     mismatches = []
     for m in raw_mismatches:
