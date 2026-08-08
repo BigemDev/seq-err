@@ -372,8 +372,6 @@ def map_single_read(
     ref_fasta.close()
 
     aligned_query = query_seq[hit.q_st:hit.q_en]
-
-    #md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, aligned_query, 0, cigar_tuples)
     
     md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, query_seq, 0, cigar_tuples)
 
@@ -381,7 +379,7 @@ def map_single_read(
     for m in raw_mismatches:
         base_qual = None
         if query_qual is not None:
-            base_qual = ord(query_qual[hit.q_st + m["query_offset"]]) - 33
+            base_qual = ord(query_qual[m["query_offset"]]) - 33
         mismatches.append({
             "ref_pos": hit.r_st + m["ref_offset"] + 1,  # 1-based
             "ref_base": m["ref_base"],
