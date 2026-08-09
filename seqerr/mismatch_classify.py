@@ -1,6 +1,8 @@
 """
 mismatch_classify.py
 
+Classifies detected mismatches as either known variants (present in VCF) or sequencing errors.
+
 """
 from __future__ import annotations
 

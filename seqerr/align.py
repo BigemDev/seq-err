@@ -1,6 +1,9 @@
 """
 align.py
 
+Maps raw FASTA/FASTQ reads to a reference genome via minimap2 (mappy) and 
+writes/returns CIGAR, MD, and mismatch data.
+
 """
 from __future__ import annotations
 

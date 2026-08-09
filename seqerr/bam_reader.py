@@ -1,6 +1,9 @@
 """
 bam_reader.py
 
+Reads a BAM file and extracts per-base mismatches (position, bases, quality) 
+between aligned reads and the reference.
+
 """
 from __future__ import annotations
 
@@ -107,7 +110,6 @@ def iter_mismatches(
 
 
 def write_mismatches_csv(mismatches: Iterator[Mismatch], out_path: str | Path) -> int:
-    """Stream Mismatch records to a CSV file. Returns the number of rows written."""
     n = 0
     with open(out_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)

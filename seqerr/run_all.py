@@ -1,6 +1,9 @@
 """
 run_all.py
 
+End-to-end pipeline: maps raw reads for two technologies,
+extracts and classifies mismatches, and compares error-quality distributions.
+
 """
 from __future__ import annotations
 

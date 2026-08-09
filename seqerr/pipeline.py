@@ -1,6 +1,8 @@
 """
 pipeline.py
 
+CLI entry point exposing individual pipeline steps: map, extract, compare, bqsr.
+
 """
 from __future__ import annotations
 
