@@ -1,6 +1,8 @@
 """
 quality_stats.py
 
+Computes and compares base-quality distributions of sequencing errors across technologies.
+
 """
 from __future__ import annotations
 

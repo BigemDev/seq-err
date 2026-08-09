@@ -1,6 +1,8 @@
 """
 vcf_reader.py
 
+Loads variant positions from a VCF/BCF file, used to distinguish known variants from sequencing errors.
+
 """
 from __future__ import annotations
 

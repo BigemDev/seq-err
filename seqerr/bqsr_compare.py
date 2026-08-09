@@ -1,6 +1,8 @@
 """
 bqsr_compare.py
 
+Compares base qualities at matching read positions before and after BQSR recalibration.
+
 """
 from __future__ import annotations
 
