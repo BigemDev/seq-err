@@ -37,14 +37,6 @@ def compare_bqsr(
     mismatches_before: Iterable[Mismatch],
     mismatches_after: Iterable[Mismatch],
 ) -> list[BqsrDelta]:
-    """
-    Pair up mismatches found in a pre-BQSR BAM and a post-BQSR BAM at the
-    same read/position and report how the base quality changed.
-
-    Only positions present in BOTH sets are reported (a base that stopped
-    being a mismatch after BQSR realignment/soft-clipping would simply drop
-    out -- that is worth noting separately, see `dropped_after_bqsr`).
-    """
     before_idx = _index_by_key(mismatches_before)
     after_idx = _index_by_key(mismatches_after)
 
@@ -74,8 +66,6 @@ def dropped_after_bqsr(
     mismatches_before: Iterable[Mismatch],
     mismatches_after: Iterable[Mismatch],
 ) -> list[Mismatch]:
-    """Mismatches present before BQSR but no longer present after (e.g. the
-    read was filtered, realigned, or the base was masked)."""
     after_keys = {
         (m.read_name, m.chrom, m.ref_pos, m.is_read1) for m in mismatches_after
     }
