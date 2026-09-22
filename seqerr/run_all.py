@@ -213,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reference", help="reference FASTA (required if mapping from reads)")
     p.add_argument("--vcf", help="VCF/BCF of called variants, to separate variants from errors")
     p.add_argument("--out-dir", required=True)
-    p.add_argument("--preset", default="sr", help="minimap2 preset for mapping (default: sr)")
+    p.add_argument("--preset", default="sr", help="mapping preset for mapping (default: sr)")
     p.add_argument("--min-mapq", type=int, default=1)
     p.add_argument("--min-base-qual", type=int, default=0)
     p.add_argument("--auto-gatk", action="store_true", help="Auto gen VCF with GATK")

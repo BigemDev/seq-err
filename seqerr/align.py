@@ -1,19 +1,47 @@
 """
 align.py
 
-Maps raw FASTA/FASTQ reads to a reference genome via minimap2 (mappy) and 
+Maps raw FASTA/FASTQ reads to a reference genome via bwa mem (bwapy) and
 writes/returns CIGAR, MD, and mismatch data.
 
 """
 from __future__ import annotations
 
 import gzip
+import re
+import shutil
+import subprocess
+import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import mappy
 import pysam
+
+if "imp" not in sys.modules:
+    try:
+        import imp  # noqa: F401
+    except ModuleNotFoundError:
+        # bwapy unconditionally does `import imp`, which was removed in
+        # Python 3.12, and actually relies on imp.find_module(name) to
+        # locate its compiled `bwalib` extension by file path so it can
+        # dlopen() it directly (bwalib's module-init symbol doesn't match
+        # its file name, so a normal `import bwalib` fails). Provide a
+        # minimal stand-in backed by importlib so that lookup still works.
+        import importlib.util as _importlib_util
+
+        def _find_module(name, path=None):
+            spec = _importlib_util.find_spec(name, path)
+            if spec is None or spec.origin is None:
+                raise ImportError(f"No module named {name!r}")
+            return None, spec.origin, None
+
+        _imp_shim = types.ModuleType("imp")
+        _imp_shim.find_module = _find_module
+        sys.modules["imp"] = _imp_shim
+
+from bwapy import BwaAligner
 
 
 def _sniff_fastx_format(path: str | Path) -> str:
@@ -51,19 +79,81 @@ def _looks_gzipped(path: Path) -> bool:
         return fh.read(2) == b"\x1f\x8b"
 
 
-def _cigar_tuples_from_mappy(hit, query_len) -> list[tuple[int, int]]:
-    cigar = []
+def _fastx_read(path: str | Path):
+    with pysam.FastxFile(str(path)) as fh:
+        for rec in fh:
+            yield rec.name, rec.sequence, rec.quality
 
-    if hit.q_st > 0:
-        cigar.append((4, hit.q_st))
 
-    cigar.extend((op, length) for length, op in hit.cigar)
+_COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
-    tail = query_len - hit.q_en
-    if tail > 0:
-        cigar.append((4, tail))
 
-    return cigar
+def _revcomp(seq: str) -> str:
+    return seq.translate(_COMPLEMENT)[::-1]
+
+
+
+_BWA_CIGAR_OP = {"M": 0, "I": 1, "D": 2, "N": 3, "S": 4, "H": 5, "P": 6, "=": 7, "X": 8}
+_CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+
+
+def _parse_bwa_cigar(cigar_string: str) -> list[tuple[int, int]]:
+    return [(_BWA_CIGAR_OP[op], int(length)) for length, op in _CIGAR_RE.findall(cigar_string)]
+
+
+def _ref_span(cigar_tuples: list[tuple[int, int]]) -> int:
+    return sum(length for op, length in cigar_tuples if op in (0, 2, 3, 7, 8))
+
+
+_BWA_INDEX_EXTS = (".bwt", ".pac", ".ann", ".amb", ".sa")
+
+
+def _ensure_bwa_index(reference_fasta: str) -> None:
+    if all(Path(reference_fasta + ext).exists() for ext in _BWA_INDEX_EXTS):
+        return
+    if shutil.which("bwa") is None:
+        raise RuntimeError(
+            "the 'bwa' command-line tool is required to build a bwa index "
+            "(bwapy only loads pre-built indexes) but was not found on PATH"
+        )
+    result = subprocess.run(
+        ["bwa", "index", reference_fasta],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"bwa index failed for {reference_fasta}:\n{result.stderr}")
+
+
+
+
+_PRESET_TO_BWA_OPTS = {
+    "sr": "",
+    "map-ont": "-x ont2d",
+    "map-pb": "-x pacbio",
+    "map-hifi": "-x pacbio",
+    "intractg": "-x intractg",
+}
+
+
+def _bwa_options_for_preset(preset: str) -> str:
+    try:
+        return _PRESET_TO_BWA_OPTS[preset]
+    except KeyError:
+        raise ValueError(
+            f"unknown preset {preset!r}; supported presets: "
+            f"{', '.join(sorted(_PRESET_TO_BWA_OPTS))}"
+        ) from None
+
+
+def _get_bwa_aligner(reference_fasta: str, preset: str) -> BwaAligner:
+    _ensure_bwa_index(reference_fasta)
+    options = _bwa_options_for_preset(preset)
+    try:
+        return BwaAligner(reference_fasta, options=options)
+    except ValueError as e:
+        raise RuntimeError(f"failed to load/index reference: {reference_fasta}") from e
+
 
 def _build_md_nm_mismatches(
     ref_seq: str, read_seq: str, ref_start: int, cigar: list[tuple[int, int]]
@@ -132,9 +222,7 @@ def map_reads_to_bam(
     fmt = _sniff_fastx_format(reads_path)  # error on bad/empty/unrecognised input
     print(f"[align] detected {fmt.upper()} input: {reads_path}")
 
-    aligner = mappy.Aligner(reference_fasta, preset=preset)
-    if not aligner:
-        raise RuntimeError(f"failed to load/index reference: {reference_fasta}")
+    aligner = _get_bwa_aligner(reference_fasta, preset)
 
     ref_fasta = pysam.FastaFile(reference_fasta)
     header = {
@@ -149,36 +237,35 @@ def map_reads_to_bam(
     n_written = 0
 
     with pysam.AlignmentFile(tmp_bam, "wb", header=header) as bam_out:
-        for name, seq, qual in mappy.fastx_read(str(reads_path)):
-            hit = None
-            for h in aligner.map(seq):
-                if h.is_primary:
-                    hit = h
-                    break
-            if hit is None:
+        for name, seq, qual in _fastx_read(str(reads_path)):
+            hits = aligner.align_seq(seq)
+            if not hits:
                 continue
+            hit = hits[0]  # bwa mem returns its best-scoring hit first
             if hit.mapq < min_mapq:
                 continue
 
+            cigar_tuples = _parse_bwa_cigar(hit.cigar)
+
             a = pysam.AlignedSegment(header=bam_out.header)
             a.query_name = name
-            a.flag = 16 if hit.strand == -1 else 0
-            a.reference_id = bam_out.get_tid(hit.ctg)
-            a.reference_start = hit.r_st
+            a.flag = 16 if hit.orient == "-" else 0
+            a.reference_id = bam_out.get_tid(hit.rname)
+            a.reference_start = hit.pos
             a.mapping_quality = hit.mapq
+            a.cigar = cigar_tuples
 
-            query_seq = seq if hit.strand == 1 else mappy.revcomp(seq)
-            a.cigar = _cigar_tuples_from_mappy(hit, len(query_seq))
-
+            query_seq = seq if hit.orient == "+" else _revcomp(seq)
             a.query_sequence = query_seq
             if qual:
-                q = qual if hit.strand == 1 else qual[::-1]
+                q = qual if hit.orient == "+" else qual[::-1]
                 a.query_qualities = pysam.qualitystring_to_array(q)
             else:
                 a.query_qualities = [30] * len(query_seq)  # no qualities
 
-            ref_region = ref_fasta.fetch(hit.ctg, hit.r_st, hit.r_en)
-           
+            ref_end = hit.pos + _ref_span(cigar_tuples)
+            ref_region = ref_fasta.fetch(hit.rname, hit.pos, ref_end)
+
             md, nm = _build_md_and_nm(ref_region, query_seq, 0, a.cigar)
 
             a.set_tag("MD", md)
@@ -197,36 +284,37 @@ def map_reads_to_bam(
 
 
 def _map_one(aligner, seq, min_mapq):
-    hit = None
-    for h in aligner.map(seq):
-        if h.is_primary:
-            hit = h
-            break
-    if hit is None or hit.mapq < min_mapq:
+    hits = aligner.align_seq(seq)
+    if not hits:
+        return None
+    hit = hits[0]  # bwa mem returns its best-scoring hit first
+    if hit.mapq < min_mapq:
         return None
     return hit
 
 
-def _build_segment(bam_out, aligner, ref_fasta, name, seq, qual, hit, technology_tag):
+def _build_segment(bam_out, ref_fasta, name, seq, qual, hit, technology_tag):
+    cigar_tuples = _parse_bwa_cigar(hit.cigar)
+
     a = pysam.AlignedSegment(header=bam_out.header)
     a.query_name = name
-    a.flag = 16 if hit.strand == -1 else 0
-    a.reference_id = bam_out.get_tid(hit.ctg)
-    a.reference_start = hit.r_st
+    a.flag = 16 if hit.orient == "-" else 0
+    a.reference_id = bam_out.get_tid(hit.rname)
+    a.reference_start = hit.pos
     a.mapping_quality = hit.mapq
+    a.cigar = cigar_tuples
 
-    query_seq = seq if hit.strand == 1 else mappy.revcomp(seq)
-    a.cigar = _cigar_tuples_from_mappy(hit, len(query_seq))
-
+    query_seq = seq if hit.orient == "+" else _revcomp(seq)
     a.query_sequence = query_seq
     if qual:
-        q = qual if hit.strand == 1 else qual[::-1]
+        q = qual if hit.orient == "+" else qual[::-1]
         a.query_qualities = pysam.qualitystring_to_array(q)
     else:
         a.query_qualities = [30] * len(query_seq)
 
-    ref_region = ref_fasta.fetch(hit.ctg, hit.r_st, hit.r_en)
-    md, nm = _build_md_and_nm(ref_region, query_seq, 0, a.cigar)
+    ref_end = hit.pos + _ref_span(cigar_tuples)
+    ref_region = ref_fasta.fetch(hit.rname, hit.pos, ref_end)
+    md, nm = _build_md_and_nm(ref_region, query_seq, 0, cigar_tuples)
     a.set_tag("MD", md)
     a.set_tag("NM", nm)
     if technology_tag:
@@ -247,9 +335,7 @@ def map_paired_reads_to_bam(
     _sniff_fastx_format(reads_r1)
     _sniff_fastx_format(reads_r2)
 
-    aligner = mappy.Aligner(reference_fasta, preset=preset)
-    if not aligner:
-        raise RuntimeError(f"failed to load/index reference: {reference_fasta}")
+    aligner = _get_bwa_aligner(reference_fasta, preset)
 
     ref_fasta = pysam.FastaFile(reference_fasta)
     header = {
@@ -265,7 +351,7 @@ def map_paired_reads_to_bam(
 
     with pysam.AlignmentFile(tmp_bam, "wb", header=header) as bam_out:
         for (n1, s1, q1), (n2, s2, q2) in zip(
-            mappy.fastx_read(str(reads_r1)), mappy.fastx_read(str(reads_r2))
+            _fastx_read(str(reads_r1)), _fastx_read(str(reads_r2))
         ):
             name = n1.split()[0]
             if name.endswith(("/1", "/2")):
@@ -277,8 +363,8 @@ def map_paired_reads_to_bam(
             if h1 is None and h2 is None:
                 continue
 
-            a1 = _build_segment(bam_out, aligner, ref_fasta, name, s1, q1, h1, technology_tag) if h1 else None
-            a2 = _build_segment(bam_out, aligner, ref_fasta, name, s2, q2, h2, technology_tag) if h2 else None
+            a1 = _build_segment(bam_out, ref_fasta, name, s1, q1, h1, technology_tag) if h1 else None
+            a2 = _build_segment(bam_out, ref_fasta, name, s2, q2, h2, technology_tag) if h2 else None
 
             for a, mate, is_read1 in ((a1, a2, True), (a2, a1, False)):
                 if a is None:
@@ -352,30 +438,25 @@ def map_single_read(
     quality: Optional[str] = None,
     preset: str = "sr",
 ) -> SingleReadAlignment:
-    aligner = mappy.Aligner(str(reference_fasta), preset=preset)
-    if not aligner:
-        raise RuntimeError(f"failed to load/index reference: {reference_fasta}")
+    reference_fasta = str(reference_fasta)
+    aligner = _get_bwa_aligner(reference_fasta, preset)
 
-    hit = None
-    for h in aligner.map(sequence):
-        if h.is_primary:
-            hit = h
-            break
-    if hit is None:
+    hits = aligner.align_seq(sequence)
+    if not hits:
         return SingleReadAlignment(read_name=read_name, mapped=False)
+    hit = hits[0]
+    
+    strand = hit.orient
+    query_seq = sequence if hit.orient == "+" else _revcomp(sequence)
+    query_qual = quality if quality is None else (quality if hit.orient == "+" else quality[::-1])
+    cigar_tuples = _parse_bwa_cigar(hit.cigar)
+    cigar_string = hit.cigar
 
-    strand = "+" if hit.strand == 1 else "-"
-    query_seq = sequence if hit.strand == 1 else mappy.revcomp(sequence)
-    query_qual = quality if quality is None else (quality if hit.strand == 1 else quality[::-1])
-    cigar_tuples = cigar_tuples = _cigar_tuples_from_mappy(hit, len(query_seq))
-    cigar_string = "".join(f"{length}{'MIDNSHP=X'[op]}" for op, length in cigar_tuples)
-
-    ref_fasta = pysam.FastaFile(str(reference_fasta))
-    ref_region = ref_fasta.fetch(hit.ctg, hit.r_st, hit.r_en)
+    ref_end = hit.pos + _ref_span(cigar_tuples)
+    ref_fasta = pysam.FastaFile(reference_fasta)
+    ref_region = ref_fasta.fetch(hit.rname, hit.pos, ref_end)
     ref_fasta.close()
 
-    aligned_query = query_seq[hit.q_st:hit.q_en]
-    
     md, nm, raw_mismatches = _build_md_nm_mismatches(ref_region, query_seq, 0, cigar_tuples)
 
     mismatches = []
@@ -384,7 +465,7 @@ def map_single_read(
         if query_qual is not None:
             base_qual = ord(query_qual[m["query_offset"]]) - 33
         mismatches.append({
-            "ref_pos": hit.r_st + m["ref_offset"] + 1,  # 1-based
+            "ref_pos": hit.pos + m["ref_offset"] + 1,  # 1-based
             "ref_base": m["ref_base"],
             "read_base": m["read_base"],
             "base_qual": base_qual,
@@ -393,9 +474,9 @@ def map_single_read(
     return SingleReadAlignment(
         read_name=read_name,
         mapped=True,
-        chrom=hit.ctg,
-        ref_start=hit.r_st,
-        ref_end=hit.r_en,
+        chrom=hit.rname,
+        ref_start=hit.pos,
+        ref_end=ref_end,
         strand=strand,
         mapping_qual=hit.mapq,
         cigar_string=cigar_string,
