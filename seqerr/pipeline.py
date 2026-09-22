@@ -136,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--reference", required=True, help="reference FASTA")
     pm.add_argument("--out", required=True, help="output BAM path (index written alongside)")
     pm.add_argument("--technology", required=True, help='e.g. "illumina" or "bgi", stored as read-group')
-    pm.add_argument("--preset", default="sr", help="minimap2 preset: sr (short reads, default), map-ont, map-pb, ...")
+    pm.add_argument("--preset", default="sr", help="mapping preset: sr (short reads, default), map-ont, map-pb, map-hifi, intractg")
     pm.add_argument("--min-mapq", type=int, default=0)
     pm.set_defaults(func=cmd_map)
 

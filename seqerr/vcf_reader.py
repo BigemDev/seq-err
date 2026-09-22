@@ -35,3 +35,4 @@ def variant_position_only_index(
 ) -> set[tuple[str, int]]:
 
     return {(chrom, pos) for chrom, pos, _, _ in variants}
+
