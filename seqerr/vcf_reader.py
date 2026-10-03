@@ -16,10 +16,11 @@ def load_variant_positions(
     vcf_path: str | Path,
     min_qual: Optional[float] = None,
     pass_only: bool = True,
+    threads: int = 1,
 ) -> set[tuple[str, int, str, str]]:
 
     positions: set[tuple[str, int, str, str]] = set()
-    with pysam.VariantFile(str(vcf_path)) as vcf:
+    with pysam.VariantFile(str(vcf_path), threads=max(1, threads)) as vcf:
         for rec in vcf:
             if pass_only and rec.filter.keys() and "PASS" not in rec.filter.keys():
                 continue
@@ -35,4 +36,3 @@ def variant_position_only_index(
 ) -> set[tuple[str, int]]:
 
     return {(chrom, pos) for chrom, pos, _, _ in variants}
-
