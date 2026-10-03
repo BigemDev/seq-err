@@ -39,6 +39,24 @@ class QualityDistribution:
             histogram=Counter(quals),
         )
 
+    @classmethod
+    def from_histogram(cls, technology: str, histogram: Counter) -> "QualityDistribution":
+        hist = Counter({q: c for q, c in histogram.items() if c > 0})
+        n = sum(hist.values())
+        if n == 0:
+            return cls(technology, 0, 0.0, 0.0, 0.0, Counter())
+        mean = sum(q * c for q, c in hist.items()) / n
+        ordered = sorted(hist)
+        def kth(k):
+            seen = 0
+            for q in ordered:
+                seen += hist[q]
+                if k < seen:
+                    return q
+        median = kth(n // 2) if n % 2 else (kth(n // 2 - 1) + kth(n // 2)) / 2
+        var = sum(c * (q - mean) ** 2 for q, c in hist.items()) / n
+        return cls(technology, n, mean, float(median), var ** 0.5 if n > 1 else 0.0, hist)
+
     def write_histogram_csv(self, out_path: str | Path) -> None:
         with open(out_path, "w", newline="") as fh:
             writer = csv.writer(fh)
