@@ -14,7 +14,6 @@ from .run_all import (  # noqa: F401
     add_threading_args,
     _extract_and_classify,
     _intersect_vcfs,
-    _maybe_call_variants,
     _prepare_reference,
     _write_summary,
     ensure_bwa_index,
@@ -53,6 +52,44 @@ def _get_or_map_bam_paired(
         threads=threads,
     )
     return bam_path
+
+
+def _maybe_call_variants_paired(
+    auto_gatk: bool,
+    reference: Optional[str],
+    out_dir: Path,
+    label_a: str,
+    label_b: str,
+    bam_a: Path,
+    bam_b: Path,
+    variant_positions: set,
+    threads: int,
+    hc_chunk_mb: int,
+    gatk_java_options: Optional[str],
+) -> tuple[set, set]:
+    if not auto_gatk:
+        return variant_positions, variant_positions
+    if not reference:
+        raise ValueError("--reference is required for --auto-gatk")
+
+    _prepare_reference(Path(reference))
+    vcf_a = out_dir / label_a / f"{label_a}.vcf"
+    vcf_b = out_dir / label_b / f"{label_b}.vcf"
+    for bam_path, vcf_path in ((bam_a, vcf_a), (bam_b, vcf_b)):
+        run_haplotypecaller_parallel(
+            bam_path,
+            reference,
+            vcf_path,
+            threads=threads,
+            chunk_size=hc_chunk_mb * 1_000_000,
+            java_options=gatk_java_options,
+        )
+
+    _intersect_vcfs(vcf_a, vcf_b, out_dir / "consensus.vcf", threads=threads)
+    return (
+        load_variant_positions(str(vcf_a), threads=threads),
+        load_variant_positions(str(vcf_b), threads=threads),
+    )
  
  
 def run_all_paired(
@@ -86,13 +123,13 @@ def run_all_paired(
     bam_path_b = _get_or_map_bam_paired(
         label_b, out_dir, reads_b1, reads_b2, bam_b, reference, threads)
 
-    variant_positions = _maybe_call_variants(
+    variant_positions_a, variant_positions_b = _maybe_call_variants_paired(
         auto_gatk, reference, out_dir, label_a, label_b, bam_path_a, bam_path_b,
         variant_positions, threads, hc_chunk_mb, gatk_java_options)
 
-    result_a = _extract_and_classify(label_a, bam_path_a, out_dir, reference, variant_positions,
+    result_a = _extract_and_classify(label_a, bam_path_a, out_dir, reference, variant_positions_a,
                                      min_mapq, min_base_qual, threads, extract_window_mb)
-    result_b = _extract_and_classify(label_b, bam_path_b, out_dir, reference, variant_positions,
+    result_b = _extract_and_classify(label_b, bam_path_b, out_dir, reference, variant_positions_b,
                                      min_mapq, min_base_qual, threads, extract_window_mb)
 
     _write_summary(out_dir, label_a, label_b, result_a, result_b)
