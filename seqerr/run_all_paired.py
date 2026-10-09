@@ -63,10 +63,24 @@ def _maybe_call_variants_paired(
     bam_a: Path,
     bam_b: Path,
     variant_positions: set,
+    vcf_a: Optional[str],
+    vcf_b: Optional[str],
+    consensus: bool,
     threads: int,
     hc_chunk_mb: int,
     gatk_java_options: Optional[str],
 ) -> tuple[set, set]:
+    if bool(vcf_a) != bool(vcf_b):
+        raise ValueError("Both --vcf-a and --vcf-b must be provided together")
+    if vcf_a and vcf_b:
+        if auto_gatk:
+            raise ValueError("Use either --auto-gatk or --vcf-a/--vcf-b")
+        if consensus:
+            _intersect_vcfs(Path(vcf_a), Path(vcf_b), out_dir / "consensus.vcf", threads=threads)
+        return (
+            load_variant_positions(vcf_a, threads=threads),
+            load_variant_positions(vcf_b, threads=threads),
+        )
     if not auto_gatk:
         return variant_positions, variant_positions
     if not reference:
@@ -85,7 +99,8 @@ def _maybe_call_variants_paired(
             java_options=gatk_java_options,
         )
 
-    _intersect_vcfs(vcf_a, vcf_b, out_dir / "consensus.vcf", threads=threads)
+    if consensus:
+        _intersect_vcfs(vcf_a, vcf_b, out_dir / "consensus.vcf", threads=threads)
     return (
         load_variant_positions(str(vcf_a), threads=threads),
         load_variant_positions(str(vcf_b), threads=threads),
@@ -111,6 +126,9 @@ def run_all_paired(
     hc_chunk_mb: int = 25,
     gatk_java_options: Optional[str] = None,
     extract_window_mb: int = 5,
+    vcf_a: Optional[str] = None,
+    vcf_b: Optional[str] = None,
+    consensus: bool = True,
 ) -> tuple[TechnologyResult, TechnologyResult]:
 
     out_dir = Path(out_dir)
@@ -125,7 +143,7 @@ def run_all_paired(
 
     variant_positions_a, variant_positions_b = _maybe_call_variants_paired(
         auto_gatk, reference, out_dir, label_a, label_b, bam_path_a, bam_path_b,
-        variant_positions, threads, hc_chunk_mb, gatk_java_options)
+        variant_positions, vcf_a, vcf_b, consensus, threads, hc_chunk_mb, gatk_java_options)
 
     result_a = _extract_and_classify(label_a, bam_path_a, out_dir, reference, variant_positions_a,
                                      min_mapq, min_base_qual, threads, extract_window_mb)
@@ -151,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label-b", default="bgi")
     p.add_argument("--reference", help="reference FASTA (required if mapping from reads)")
     p.add_argument("--vcf", help="VCF/BCF of called variants, to separate variants from errors")
+    p.add_argument("--vcf-a", help="technology A: its own called VCF (requires --vcf-b)")
+    p.add_argument("--vcf-b", help="technology B: its own called VCF (requires --vcf-a)")
+    p.add_argument("--consensus", action=argparse.BooleanOptionalAction, default=True,
+                   help="write consensus.vcf from the per-read VCFs (default: enabled; use --no-consensus to disable)")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--min-mapq", type=int, default=1)
     p.add_argument("--min-base-qual", type=int, default=0)
@@ -173,6 +195,9 @@ def main(argv: list[str] | None = None) -> None:
         bam_b=args.bam_b,
         reference=args.reference,
         vcf=args.vcf,
+        vcf_a=args.vcf_a,
+        vcf_b=args.vcf_b,
+        consensus=args.consensus,
         min_mapq=args.min_mapq,
         min_base_qual=args.min_base_qual,
         auto_gatk=args.auto_gatk,
