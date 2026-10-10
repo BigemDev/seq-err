@@ -1,8 +1,10 @@
 # synthetic data 
 synthetic_ref.fa
 synthetic_ref.fa.fai
-synthetic_illumina.fastq
-synthetic_bgi.fastq
+synthetic_illumina_R1.fastq
+synthetic_illumina_R2.fastq
+synthetic_bgi_R1.fastq
+synthetic_bgi_R2.fastq
 synthetic_results/
 
 # random artifacts

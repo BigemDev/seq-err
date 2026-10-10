@@ -3,7 +3,7 @@ import random
 import pysam
 import pytest
 
-from seqerr.run_all_paired import run_all_paired, _get_or_map_bam_paired
+from seqerr.run_all import run_all
 
 
 def _make_reference(tmp_path, length=3000, seed=42):
@@ -46,7 +46,7 @@ def test_run_all_paired_end_to_end(tmp_path):
     _make_paired_fastq(bgi1, bgi2, ref_seq, 5, mismatch_offset=40, mismatch_qual=38)
 
     out_dir = tmp_path / "results"
-    a, b = run_all_paired(
+    a, b = run_all(
         out_dir=out_dir,
         label_a="illumina", label_b="bgi",
         reads_a1=str(ill1), reads_a2=str(ill2),
@@ -68,3 +68,7 @@ def test_run_all_paired_end_to_end(tmp_path):
     assert any(r.is_read1 for r in recs) and any(r.is_read2 for r in recs)
     assert all(r.is_paired for r in recs)
 
+
+def test_run_all_requires_both_read_files(tmp_path):
+    with pytest.raises(ValueError, match="both R1 and R2"):
+        run_all(out_dir=tmp_path, label_a="a", label_b="b", reads_a1="r1.fq")

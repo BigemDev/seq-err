@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import csv
 import multiprocessing as mp
-import os
 import shutil
 from collections import Counter
 from dataclasses import dataclass, asdict
@@ -172,17 +171,6 @@ def iter_mismatches(
 def _row(m: Mismatch) -> list:
     return [m.read_name, m.technology, m.chrom, m.ref_pos, m.ref_base, m.read_base,
             m.base_qual, m.mapping_qual, m.cigar, m.is_read1, m.is_reverse]
-
-
-def write_mismatches_csv(mismatches: Iterator[Mismatch], out_path: str | Path) -> int:
-    n = 0
-    with open(out_path, "w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(CSV_FIELDS)
-        for m in mismatches:
-            writer.writerow(_row(m))
-            n += 1
-    return n
 
 
 @dataclass

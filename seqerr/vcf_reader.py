@@ -29,10 +29,3 @@ def load_variant_positions(
             for alt in rec.alts or ():
                 positions.add((rec.chrom, rec.pos, rec.ref, alt))
     return positions
-
-
-def variant_position_only_index(
-    variants: set[tuple[str, int, str, str]]
-) -> set[tuple[str, int]]:
-
-    return {(chrom, pos) for chrom, pos, _, _ in variants}
