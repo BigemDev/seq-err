@@ -98,9 +98,10 @@ def _revcomp(seq: str) -> str:
     return seq.translate(_COMPLEMENT)[::-1]
 
 
-def generate_reads_fastq(
+def generate_paired_reads_fastq(
     ref_seq: str,
-    out_fastq: str | Path,
+    out_r1: str | Path,
+    out_r2: str | Path,
     variants: tuple[TruthVariant, ...] = TRUTH_VARIANTS,
     read_length: int = READ_LENGTH,
     depth: int = TARGET_DEPTH,
@@ -118,39 +119,38 @@ def generate_reads_fastq(
     hap_b_variants = hom_variants + het_variants
 
     rng = random.Random(seed)
+    fragment_length = 2 * read_length
     margin = read_length
-    n_reads = (depth * (len(ref_seq) - 2 * margin)) // read_length
-    lines = []
-    n_written = 0
-    for i in range(n_reads):
-        g_start = rng.randint(margin, len(ref_seq) - margin - read_length)
+    n_pairs = (depth * (len(ref_seq) - 2 * margin)) // fragment_length
+    r1_lines, r2_lines = [], []
+    for i in range(n_pairs):
+        g_start = rng.randint(margin, len(ref_seq) - margin - fragment_length)
         if rng.random() < 0.5:
             hap_seq, hap_variants = hap_a, hap_a_variants
         else:
             hap_seq, hap_variants = hap_b, hap_b_variants
- 
         local_start = g_start + _haplotype_offset(g_start, hap_variants)
-        read = list(hap_seq[local_start:local_start + read_length])
-        if len(read) != read_length:
+        first = hap_seq[local_start:local_start + read_length]
+        second_start = local_start + fragment_length - read_length
+        second = _revcomp(hap_seq[second_start:second_start + read_length])
+        if len(first) != read_length or len(second) != read_length:
             continue
 
-        quals = [base_qual] * read_length
-        for pos in range(read_length):
-            if rng.random() < error_rate:
-                read[pos] = rng.choice([b for b in "ACGT" if b != read[pos]])
-                quals[pos] = error_qual
- 
-        seq = "".join(read)
-        if rng.random() < 0.5:
-            seq = _revcomp(seq)
-            quals = quals[::-1]
- 
-        qual_str = "".join(chr(33 + q) for q in quals)
-        lines.append(f"@read{i}\n{seq}\n+\n{qual_str}\n")
-        n_written += 1
- 
-    Path(out_fastq).write_text("".join(lines))
-    return n_written
+        reads, quals = [], []
+        for sequence in (first, second):
+            read, quality = list(sequence), [base_qual] * read_length
+            for pos in range(read_length):
+                if rng.random() < error_rate:
+                    read[pos] = rng.choice([b for b in "ACGT" if b != read[pos]])
+                    quality[pos] = error_qual
+            reads.append("".join(read))
+            quals.append("".join(chr(33 + q) for q in quality))
+        r1_lines.append(f"@read{i}/1\n{reads[0]}\n+\n{quals[0]}\n")
+        r2_lines.append(f"@read{i}/2\n{reads[1]}\n+\n{quals[1]}\n")
+
+    Path(out_r1).write_text("".join(r1_lines))
+    Path(out_r2).write_text("".join(r2_lines))
+    return len(r1_lines)
 
 
 def write_truth_vcf(
@@ -176,7 +176,8 @@ def write_truth_vcf(
 @dataclass
 class SyntheticVariantDataset:
     reference_fasta: Path
-    reads_fastq: Path
+    reads_r1_fastq: Path
+    reads_r2_fastq: Path
     truth_vcf: Path
     variants: tuple[TruthVariant, ...]
     n_reads: int
@@ -196,15 +197,18 @@ def generate_synthetic_variant_dataset(
     reference_fasta.write_text(f">{CHROM}\n{ref_seq}\n")
     pysam.faidx(str(reference_fasta))
  
-    reads_fastq = out_dir / "synthetic_variant_reads.fastq"
-    n_reads = generate_reads_fastq(ref_seq, reads_fastq, depth=depth, seed=seed + 1000)
+    reads_r1 = out_dir / "synthetic_variant_reads_R1.fastq"
+    reads_r2 = out_dir / "synthetic_variant_reads_R2.fastq"
+    n_reads = generate_paired_reads_fastq(
+        ref_seq, reads_r1, reads_r2, depth=depth, seed=seed + 1000)
  
     truth_vcf = out_dir / "synthetic_variant_truth.vcf"
     write_truth_vcf(TRUTH_VARIANTS, REF_LENGTH, truth_vcf)
  
     return SyntheticVariantDataset(
         reference_fasta=reference_fasta,
-        reads_fastq=reads_fastq,
+        reads_r1_fastq=reads_r1,
+        reads_r2_fastq=reads_r2,
         truth_vcf=truth_vcf,
         variants=TRUTH_VARIANTS,
         n_reads=n_reads,
@@ -213,6 +217,6 @@ def generate_synthetic_variant_dataset(
  
 if __name__ == "__main__":
     ds = generate_synthetic_variant_dataset("synthetic_variant_data")
-    print(f"Generated {ds.n_reads} reads {ds.reads_fastq}")
+    print(f"Generated {ds.n_reads} read pairs {ds.reads_r1_fastq} {ds.reads_r2_fastq}")
     print(f"Reference {ds.reference_fasta}")
     print(f"Truth VCF ({len(ds.variants)} variants) {ds.truth_vcf}")

@@ -13,33 +13,18 @@ from collections import Counter
 from pathlib import Path
 
 from .run_all import map_paired_bwa_mem
-from .bam_reader import (iter_mismatches_parallel, extract_errors_parallel,
-                         write_mismatches_csv, Mismatch, CSV_FIELDS)
+from .bam_reader import iter_mismatches_parallel, extract_errors_parallel
 from .vcf_reader import load_variant_positions
 from .mismatch_classify import classify_mismatches
 from .bqsr_compare import compare_bqsr, dropped_after_bqsr, write_bqsr_deltas_csv
 from .quality_stats import QualityDistribution, summarize_comparison
 
 
-def _read_mismatches_csv(path: str | Path) -> list[Mismatch]:
-    with open(path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        out = []
-        for row in reader:
-            row["ref_pos"] = int(row["ref_pos"])
-            row["base_qual"] = int(row["base_qual"])
-            row["mapping_qual"] = int(row["mapping_qual"])
-            row["is_read1"] = row["is_read1"] == "True"
-            row["is_reverse"] = row["is_reverse"] == "True"
-            out.append(Mismatch(**row))
-        return out
-
-
 def cmd_map(args: argparse.Namespace) -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n = map_paired_bwa_mem(
-        reads_r1=args.reads,
+        reads_r1=args.reads1,
         reads_r2=args.reads2,
         reference_fasta=args.reference,
         out_bam=out_path,
@@ -47,7 +32,7 @@ def cmd_map(args: argparse.Namespace) -> None:
         threads=args.threads,
         preset=args.preset,
     )
-    
+    print(f"[map] wrote {n} aligned reads -> {out_path}")
 
 def cmd_extract(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
@@ -144,14 +129,13 @@ def build_parser() -> argparse.ArgumentParser:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
 
-    pm = sub.add_parser("map", help="Map raw FASTA/FASTQ reads to a reference -> sorted+indexed BAM")
-    pm.add_argument("--reads", required=True, help="FASTA or FASTQ (.gz OK) reads file")
+    pm = sub.add_parser("map", help="Map paired FASTA/FASTQ reads to a reference -> sorted+indexed BAM")
+    pm.add_argument("--reads1", required=True, help="R1 FASTA or FASTQ (.gz OK)")
+    pm.add_argument("--reads2", required=True, help="R2 FASTA or FASTQ (.gz OK)")
     pm.add_argument("--reference", required=True, help="reference FASTA")
     pm.add_argument("--out", required=True, help="output BAM path (index written alongside)")
     pm.add_argument("--technology", required=True, help='e.g. "illumina" or "bgi", stored as read-group')
     pm.add_argument("--preset", default="sr", help="mapping preset: sr (short reads, default), map-ont, map-pb, map-hifi, intractg")
-    pm.add_argument("--reads2", help="R2 reads for paired-end mapping (--reads is then R1)")
-    pm.add_argument("--min-mapq", type=int, default=0, help="kept for compatibility; filter at extract time")
     pm.add_argument("--threads", type=int, default=4, help="bwa mem / samtools threads")
     pm.set_defaults(func=cmd_map)
 

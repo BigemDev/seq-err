@@ -1,10 +1,4 @@
-"""
-run_all.py
-
-End-to-end pipeline: maps raw reads for two technologies,
-extracts and classifies mismatches, and compares error-quality distributions.
-
-"""
+"""Run the paired-read mismatch and quality comparison pipeline."""
 from __future__ import annotations
 
 import argparse
@@ -55,7 +49,7 @@ _PRESET_TO_BWA_OPTS = {
 
 def map_paired_bwa_mem(
     reads_r1: str | Path,
-    reads_r2: Optional[str | Path],
+    reads_r2: str | Path,
     reference_fasta: str | Path,
     out_bam: str | Path,
     label: str,
@@ -65,7 +59,7 @@ def map_paired_bwa_mem(
     platform: str = "ILLUMINA",
     preset: str = "sr",
 ) -> int:
-    """bwa mem | samtools sort | samtools index. reads_r2=None maps single-end."""
+    """Map paired reads with bwa mem and write a sorted, indexed BAM."""
     if preset not in _PRESET_TO_BWA_OPTS:
         raise ValueError(f"unknown preset {preset!r}; supported presets: "
                          f"{', '.join(sorted(_PRESET_TO_BWA_OPTS))}")
@@ -81,9 +75,8 @@ def map_paired_bwa_mem(
     rg = f"@RG\\tID:{label}\\tSM:{label}\\tPL:{platform}"
 
     bwa_cmd = ["bwa", "mem", "-t", str(threads), "-R", rg,
-               *_PRESET_TO_BWA_OPTS[preset], str(reference_fasta), str(reads_r1)]
-    if reads_r2:
-        bwa_cmd.append(str(reads_r2))
+               *_PRESET_TO_BWA_OPTS[preset], str(reference_fasta),
+               str(reads_r1), str(reads_r2)]
     sort_cmd = ["samtools", "sort", "-@", str(sort_threads), "-m", sort_mem,
                 "-T", str(out_bam.with_suffix("")) + ".sorttmp",
                 "-o", str(out_bam), "-"]
@@ -173,6 +166,8 @@ def run_haplotypecaller_parallel(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     tasks = plan_intervals(read_fai(reference), chunk_size)
+    if not tasks:
+        raise ValueError(f"reference has no contigs to process: {reference}")
     print(f"[gatk] {out_vcf.name}: {len(tasks)} interval tasks, {threads} parallel")
 
     shards: dict[int, Path] = {}
@@ -205,23 +200,25 @@ def run_haplotypecaller_parallel(
 def _get_or_map_bam(
     label: str,
     out_dir: Path,
-    reads: Optional[str],
+    reads_r1: Optional[str],
+    reads_r2: Optional[str],
     bam: Optional[str],
     reference: Optional[str],
     preset: str,
-    min_mapq: int,
     threads: int = 1,
 ) -> Path:
     if bam:
+        if reads_r1 or reads_r2:
+            raise ValueError(f"[{label}] provide either --bam or both read files, not both")
         return Path(bam)
-    if not reads:
-        raise ValueError(f"[{label}] need either --reads-{label[0]} or --bam-{label[0]}")
+    if not reads_r1 or not reads_r2:
+        raise ValueError(f"[{label}] both R1 and R2 reads are required unless a BAM is provided")
     if not reference:
         raise ValueError(f"[{label}] --reference is required when mapping from reads")
 
     bam_path = out_dir / label / f"{label}.sorted.bam"
     n = map_paired_bwa_mem(
-        reads_r1=reads, reads_r2=None, reference_fasta=reference,
+        reads_r1=reads_r1, reads_r2=reads_r2, reference_fasta=reference,
         out_bam=bam_path, label=label, threads=threads, preset=preset,
     )
     print(f"[{label}] mapped {n} alignments with bwa mem -> {bam_path}")
@@ -290,22 +287,22 @@ def _prepare_reference(reference_path: Path):
         ], check=True)
 
 
-def _run_variant_calling(bam_path: Path, reference: Path, out_vcf: Path, threads: int = 1,
-                         chunk_size: int = 25_000_000, java_options: Optional[str] = None):
-    run_haplotypecaller_parallel(bam_path, reference, out_vcf, threads=threads,
-                                 chunk_size=chunk_size, java_options=java_options)
-
-
 def _intersect_vcfs(vcf_a: Path, vcf_b: Path, out_vcf: Path, threads: int = 1):
     t = str(max(1, threads))
-    for v in [vcf_a, vcf_b]:
-        with open(f"{v}.gz", "wb") as f_out:
-            subprocess.run(["bgzip", "-@", t, "-c", str(v)], stdout=f_out, check=True)
-        subprocess.run(["bcftools", "index", "--threads", t, f"{v}.gz"], check=True)
+    indexed = []
+    for vcf in (vcf_a, vcf_b):
+        if vcf.suffix == ".bcf" or vcf.name.endswith((".vcf.gz", ".vcf.bgz")):
+            compressed = vcf
+        else:
+            compressed = Path(f"{vcf}.gz")
+            with open(compressed, "wb") as out:
+                subprocess.run(["bgzip", "-@", t, "-c", str(vcf)], stdout=out, check=True)
+        subprocess.run(["bcftools", "index", "--threads", t, "-f", str(compressed)], check=True)
+        indexed.append(str(compressed))
 
     subprocess.run([
         "bcftools", "isec", "--threads", t, "-n=2", "-w", "1",
-        f"{vcf_a}.gz", f"{vcf_b}.gz",
+        *indexed,
         "-O", "v", "-o", str(out_vcf)
     ], check=True)
 
@@ -314,61 +311,94 @@ def run_all(
     out_dir: str | Path,
     label_a: str,
     label_b: str,
-    reads_a: Optional[str] = None,
-    reads_b: Optional[str] = None,
+    reads_a1: Optional[str] = None,
+    reads_a2: Optional[str] = None,
+    reads_b1: Optional[str] = None,
+    reads_b2: Optional[str] = None,
     bam_a: Optional[str] = None,
     bam_b: Optional[str] = None,
     reference: Optional[str] = None,
     vcf: Optional[str] = None,
-    preset: str = "sr",
     min_mapq: int = 1,
     min_base_qual: int = 0,
     auto_gatk: bool = False,
-    threads: int = 1,
+    threads: int = 4,
     hc_chunk_mb: int = 25,
     gatk_java_options: Optional[str] = None,
     extract_window_mb: int = 5,
+    vcf_a: Optional[str] = None,
+    vcf_b: Optional[str] = None,
+    consensus: bool = True,
+    preset: str = "sr",
 ) -> tuple[TechnologyResult, TechnologyResult]:
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    variant_positions = load_variant_positions(vcf, threads=threads) if vcf else set()
+    if bool(vcf_a) != bool(vcf_b):
+        raise ValueError("Both --vcf-a and --vcf-b must be provided together")
+    if vcf and (vcf_a or auto_gatk):
+        raise ValueError("Use either --vcf, --vcf-a/--vcf-b, or --auto-gatk")
+    if auto_gatk and (vcf_a or vcf_b):
+        raise ValueError("Use either --auto-gatk or --vcf-a/--vcf-b")
 
-    bam_path_a = _get_or_map_bam(label_a, out_dir, reads_a, bam_a, reference, preset, min_mapq, threads)
-    bam_path_b = _get_or_map_bam(label_b, out_dir, reads_b, bam_b, reference, preset, min_mapq, threads)
+    bam_path_a = _get_or_map_bam(
+        label_a, out_dir, reads_a1, reads_a2, bam_a, reference, preset, threads)
+    bam_path_b = _get_or_map_bam(
+        label_b, out_dir, reads_b1, reads_b2, bam_b, reference, preset, threads)
 
-    variant_positions = _maybe_call_variants(
+    variant_positions_a, variant_positions_b = _variant_positions_for_samples(
         auto_gatk, reference, out_dir, label_a, label_b, bam_path_a, bam_path_b,
-        variant_positions, threads, hc_chunk_mb, gatk_java_options)
+        vcf, vcf_a, vcf_b, consensus, threads, hc_chunk_mb, gatk_java_options)
 
-    result_a = _extract_and_classify(label_a, bam_path_a, out_dir, reference, variant_positions,
+    result_a = _extract_and_classify(label_a, bam_path_a, out_dir, reference, variant_positions_a,
                                      min_mapq, min_base_qual, threads, extract_window_mb)
-    result_b = _extract_and_classify(label_b, bam_path_b, out_dir, reference, variant_positions,
+    result_b = _extract_and_classify(label_b, bam_path_b, out_dir, reference, variant_positions_b,
                                      min_mapq, min_base_qual, threads, extract_window_mb)
 
     _write_summary(out_dir, label_a, label_b, result_a, result_b)
     return result_a, result_b
 
 
-def _maybe_call_variants(auto_gatk, reference, out_dir, label_a, label_b, bam_a, bam_b,
-                         variant_positions, threads, hc_chunk_mb, gatk_java_options):
+def _variant_positions_for_samples(
+    auto_gatk: bool,
+    reference: Optional[str],
+    out_dir: Path,
+    label_a: str,
+    label_b: str,
+    bam_a: Path,
+    bam_b: Path,
+    vcf: Optional[str],
+    vcf_a: Optional[str],
+    vcf_b: Optional[str],
+    consensus: bool,
+    threads: int,
+    hc_chunk_mb: int,
+    gatk_java_options: Optional[str],
+) -> tuple[set, set]:
+    if vcf_a and vcf_b:
+        if consensus:
+            _intersect_vcfs(Path(vcf_a), Path(vcf_b), out_dir / "consensus.vcf", threads)
+        return (load_variant_positions(vcf_a, threads=threads),
+                load_variant_positions(vcf_b, threads=threads))
+
     if not auto_gatk:
-        return variant_positions
+        positions = load_variant_positions(vcf, threads=threads) if vcf else set()
+        return positions, positions
     if not reference:
         raise ValueError("--reference is required for --auto-gatk")
+
     _prepare_reference(Path(reference))
-
-    vcf_a = out_dir / label_a / f"{label_a}.vcf"
-    vcf_b = out_dir / label_b / f"{label_b}.vcf"
-    consensus_vcf = out_dir / "consensus.vcf"
-
-    for bam_p, vcf_p in ((bam_a, vcf_a), (bam_b, vcf_b)):
+    paths = (out_dir / label_a / f"{label_a}.vcf", out_dir / label_b / f"{label_b}.vcf")
+    for bam_path, vcf_path in zip((bam_a, bam_b), paths):
         run_haplotypecaller_parallel(
-            bam_p, reference, vcf_p, threads=threads,
+            bam_path, reference, vcf_path, threads=threads,
             chunk_size=hc_chunk_mb * 1_000_000, java_options=gatk_java_options)
-    _intersect_vcfs(vcf_a, vcf_b, consensus_vcf, threads=threads)
-    return load_variant_positions(str(consensus_vcf), threads=threads)
+    if consensus:
+        _intersect_vcfs(paths[0], paths[1], out_dir / "consensus.vcf", threads)
+    positions_a = load_variant_positions(str(paths[0]), threads=threads)
+    positions_b = load_variant_positions(str(paths[1]), threads=threads)
+    return positions_a, positions_b
 
 
 def _write_summary(out_dir, label_a, label_b, result_a, result_b):
@@ -386,14 +416,20 @@ def build_parser() -> argparse.ArgumentParser:
         prog="seqerr.run_all", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--reads-a", help="technology A: raw FASTA/FASTQ reads")
-    p.add_argument("--reads-b", help="technology B: raw FASTA/FASTQ reads")
+    p.add_argument("--reads-a1", help="technology A: R1 reads (FASTA/FASTQ, .gz OK)")
+    p.add_argument("--reads-a2", help="technology A: R2 reads (FASTA/FASTQ, .gz OK)")
+    p.add_argument("--reads-b1", help="technology B: R1 reads (FASTA/FASTQ, .gz OK)")
+    p.add_argument("--reads-b2", help="technology B: R2 reads (FASTA/FASTQ, .gz OK)")
     p.add_argument("--bam-a", help="technology A: already-mapped, indexed BAM (skip mapping)")
     p.add_argument("--bam-b", help="technology B: already-mapped, indexed BAM (skip mapping)")
     p.add_argument("--label-a", default="illumina")
     p.add_argument("--label-b", default="bgi")
     p.add_argument("--reference", help="reference FASTA (required if mapping from reads)")
     p.add_argument("--vcf", help="VCF/BCF of called variants, to separate variants from errors")
+    p.add_argument("--vcf-a", help="technology A: its own called VCF (requires --vcf-b)")
+    p.add_argument("--vcf-b", help="technology B: its own called VCF (requires --vcf-a)")
+    p.add_argument("--consensus", action=argparse.BooleanOptionalAction, default=True,
+                   help="write consensus.vcf from per-technology VCFs (default: enabled)")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--preset", default="sr", help="mapping preset for mapping (default: sr)")
     p.add_argument("--min-mapq", type=int, default=1)
@@ -420,12 +456,17 @@ def main(argv: list[str] | None = None) -> None:
         out_dir=args.out_dir,
         label_a=args.label_a,
         label_b=args.label_b,
-        reads_a=args.reads_a,
-        reads_b=args.reads_b,
+        reads_a1=args.reads_a1,
+        reads_a2=args.reads_a2,
+        reads_b1=args.reads_b1,
+        reads_b2=args.reads_b2,
         bam_a=args.bam_a,
         bam_b=args.bam_b,
         reference=args.reference,
         vcf=args.vcf,
+        vcf_a=args.vcf_a,
+        vcf_b=args.vcf_b,
+        consensus=args.consensus,
         preset=args.preset,
         min_mapq=args.min_mapq,
         min_base_qual=args.min_base_qual,
