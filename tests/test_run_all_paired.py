@@ -37,7 +37,7 @@ def _make_paired_fastq(path1, path2, ref_seq, n_pairs, mismatch_offset,
     path2.write_text("".join(l2))
 
 
-def test_run_all_paired_end_to_end(tmp_path):
+def test_run_all_end_to_end(tmp_path):
     ref_fa, ref_seq = _make_reference(tmp_path)
 
     ill1, ill2 = tmp_path / "ill_1.fq", tmp_path / "ill_2.fq"
