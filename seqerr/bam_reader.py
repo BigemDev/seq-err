@@ -31,6 +31,7 @@ class Mismatch:
     cigar: str                 # full CIGAR string of the read
     is_read1: bool
     is_reverse: bool
+    depth: int = 0                # read depth at this position (filled later)
 
     def as_row(self) -> dict:
         return asdict(self)
@@ -170,7 +171,7 @@ def iter_mismatches(
 
 def _row(m: Mismatch) -> list:
     return [m.read_name, m.technology, m.chrom, m.ref_pos, m.ref_base, m.read_base,
-            m.base_qual, m.mapping_qual, m.cigar, m.is_read1, m.is_reverse]
+            m.base_qual, m.mapping_qual, m.cigar, m.is_read1, m.is_reverse,m.depth]
 
 
 @dataclass
