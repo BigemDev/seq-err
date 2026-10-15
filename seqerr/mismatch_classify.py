@@ -1,49 +1,39 @@
-"""
-mismatch_classify.py
+"""Classify mismatches, filter sequencing errors by QC and plot distributions.
 
-Classifies detected mismatches as either known variants (present in VCF) or sequencing errors.
-
+Depth is computed only at positions containing non-VCF mismatches (errors).
+Variants are retained, but depth QC is deliberately not applied to them.
 """
 from __future__ import annotations
 
+from collections import Counter, defaultdict
+from functools import lru_cache
+from pathlib import Path
 from typing import Iterable
-
-from .bam_reader import Mismatch
-
-from collections import defaultdict
-
-import pandas as pd
-import sys
-import os
 import re
-import argparse
+
 import pysam
-import matplotlib.pyplot as plt
 
-def calculate_alignment_fraction(cigar):
+from .bam_reader import Mismatch, _min_mapq_ok
 
+
+@lru_cache(maxsize=100_000)
+def calculate_alignment_fraction(cigar: str) -> float:
     if not cigar:
-        return 0
+        return 0.0
 
     operations = re.findall(r"(\d+)([MIDNSHP=X])", cigar)
-
     aligned = 0
     read_length = 0
 
-    for length, operation in operations:
-
-        length = int(length)
-
+    for length_text, operation in operations:
+        length = int(length_text)
         if operation in "MIS=X":
             read_length += length
-
         if operation in "M=X":
             aligned += length
 
-    if read_length == 0:
-        return 0
+    return aligned / read_length if read_length else 0.0
 
-    return aligned / read_length
 
 def classify_mismatches(
     mismatches: Iterable[Mismatch],
@@ -51,64 +41,67 @@ def classify_mismatches(
 ) -> tuple[list[Mismatch], list[Mismatch]]:
     errors: list[Mismatch] = []
     variants: list[Mismatch] = []
-
     for m in mismatches:
         key = (m.chrom, m.ref_pos, m.ref_base, m.read_base)
         if key in variant_positions:
             variants.append(m)
         else:
             errors.append(m)
-
     return errors, variants
+
 
 def calculate_depth(
     bam_path: str,
     interesting_positions: set[tuple[str, int]],
     min_alignment_fraction: float = 0.8,
+    min_mapq: int = 0,
 ) -> dict[tuple[str, int], int]:
-    """Calculate filtered read depth at selected 1-based positions."""
-    depth: dict[tuple[str, int], int] = defaultdict(int)
+    """Count eligible read observations only at requested 1-based positions.
 
-    for position in interesting_positions:
-        depth[position] = 0
+    Per chromosome, use one bounded, indexed pileup from minimum to maximum
+    interesting position. This avoids rescanning the WHOLE BAM per worker.
+    The numerator and denominator use the same read flag/MAPQ rules.
+    """
+    depth: dict[tuple[str, int], int] = {position: 0 for position in interesting_positions}
+    if not interesting_positions:
+        return depth
 
-    with pysam.AlignmentFile(bam_path, "rb") as bam:
-        for column in bam.pileup(
-            truncate=False,
-            stepper="all",
-            min_base_quality=0,
-            min_mapping_quality=0,
-        ):
-            chrom = column.reference_name
-            position = column.reference_pos + 1
-            key = (chrom, position)
+    positions_by_chrom: dict[str, set[int]] = defaultdict(set)
+    for chrom, position in interesting_positions:
+        positions_by_chrom[chrom].add(position)
 
-            if key not in interesting_positions:
-                continue
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for chrom, positions in positions_by_chrom.items():
+            start = min(positions) - 1  # 0-based inclusive
+            stop = max(positions)       # 0-based exclusive
 
-            coverage = 0
-
-            for pileup_read in column.pileups:
-                if pileup_read.is_del or pileup_read.is_refskip:
+            for column in bam.pileup(
+                chrom, start, stop,
+                truncate=True,
+                stepper="nofilter",  # explicit consistent filtering below
+                min_base_quality=0,
+                min_mapping_quality=0,
+                ignore_overlaps=False,  # match per-read extraction
+                max_depth=100_000,
+            ):
+                pos = column.reference_pos + 1
+                if pos not in positions:
                     continue
 
-                alignment = pileup_read.alignment
+                coverage = 0
+                for pileup_read in column.pileups:
+                    if pileup_read.is_del or pileup_read.is_refskip:
+                        continue
+                    read = pileup_read.alignment
+                    if not _min_mapq_ok(read, min_mapq):
+                        continue
+                    if calculate_alignment_fraction(read.cigarstring or "") < min_alignment_fraction:
+                        continue
+                    coverage += 1
+                depth[(chrom, pos)] = coverage
 
-                if alignment.is_duplicate or alignment.is_unmapped:
-                    continue
+    return depth
 
-                fraction = calculate_alignment_fraction(
-                    alignment.cigarstring
-                )
-
-                if fraction < min_alignment_fraction:
-                    continue
-
-                coverage += 1
-
-            depth[key] = coverage
-
-    return dict(depth)
 
 def filter_mismatches_by_qc(
     mismatches: Iterable[Mismatch],
@@ -116,55 +109,136 @@ def filter_mismatches_by_qc(
     min_alignment_fraction: float = 0.8,
     min_depth: int = 10,
 ) -> list[Mismatch]:
-    """Keep mismatches meeting alignment-fraction and depth thresholds."""
     filtered: list[Mismatch] = []
-
     for mismatch in mismatches:
-        fraction = calculate_alignment_fraction(mismatch.cigar)
-
-        position_depth = depth.get(
-            (mismatch.chrom, mismatch.ref_pos),
-            0,
-        )
-
-        if fraction < min_alignment_fraction:
+        if calculate_alignment_fraction(mismatch.cigar) < min_alignment_fraction:
             continue
-
-        if position_depth < min_depth:
+        if depth.get((mismatch.chrom, mismatch.ref_pos), 0) < min_depth:
             continue
-
         filtered.append(mismatch)
-
     return filtered
 
+
+def _save_count_plot(
+    counts: dict[int, int | float] | Counter,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    filepath: Path,
+) -> None:
+    if not counts:
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = sorted(counts)
+    y = [counts[k] for k in x]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(x, y, width=0.9, edgecolor="black", linewidth=0.3)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(filepath, dpi=150)
+    plt.close(fig)
+
+
+def plot_error_histograms_from_counts(
+    base_qual_counts: Counter,
+    depth_counts: Counter,
+    mapq_counts: Counter,
+    weighted_quality_counts: dict[int, float],
+    technology: str,
+    output_dir: str = "histograms",
+) -> None:
+    """Plots from aggregated counts: safe to use after multiprocessing."""
+    output_path = Path(output_dir) / technology
+    output_path.mkdir(parents=True, exist_ok=True)
+    datasets = [
+        (depth_counts, "Depth", "Number of errors", "depth_errors_histogram.png"),
+        (base_qual_counts, "Base quality (Phred)", "Number of errors", "base_qual_errors_histogram.png"),
+        (mapq_counts, "Mapping quality (MAPQ)", "Number of errors", "mapping_qual_errors_histogram.png"),
+        (
+            weighted_quality_counts,
+            "Base quality (Phred)",
+            "Sum of 1 / depth (coverage-weighted errors)",
+            "base_qual_depth_weighted_histogram.png",
+        ),
+    ]
+    for counts, xlabel, ylabel, filename in datasets:
+        _save_count_plot(counts, f"{technology.upper()} errors: {xlabel}", xlabel, ylabel, output_path / filename)
+
+"""
 def plot_error_histograms(
     errors: list[Mismatch],
     technology: str,
     output_dir: str = "histograms",
-):
-    output_path = os.path.join(output_dir, technology)
-    os.makedirs(output_path, exist_ok=True)
+) -> None:
+    
+    qual = Counter(m.base_qual for m in errors)
+    depths = Counter(m.depth for m in errors)
+    mapq = Counter(m.mapping_qual for m in errors)
+    weighted: dict[int, float] = defaultdict(float)
+    
+    for m in errors:
+        if m.depth > 0:
+            weighted[m.base_qual] += 1.0 / m.depth
+    plot_error_histograms_from_counts(qual, depths, mapq, dict(weighted), technology, output_dir)
+"""
+def plot_quality_depth_heatmap_from_counts(
+    quality_by_depth_counts: Counter,
+    total_by_depth_counts: Counter,
+    technology: str,
+    output_dir: str = "histograms",
+) -> None:
+    if not quality_by_depth_counts or not total_by_depth_counts:
+        return
 
-    datasets = [
-        ("depth", "Depth", [m.depth for m in errors]),
-        ("base_qual", "Base quality (Phred)", [m.base_qual for m in errors]),
-        ("mapping_qual", "Mapping quality (MAPQ)", [m.mapping_qual for m in errors]),
-    ]
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
 
-    for filename, xlabel, values in datasets:
-        if not values:
-            continue
+    output_path = Path(output_dir) / technology
+    output_path.mkdir(parents=True, exist_ok=True)
 
-        fig, ax = plt.subplots(figsize=(9, 5))
-        ax.hist(values, bins=30, edgecolor="black", alpha=0.75)
+    depth_bins = sorted(total_by_depth_counts.keys())
+    quality_bins = sorted({quality_bin for (_, quality_bin) in quality_by_depth_counts.keys()})
 
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Number of errors")
-        ax.set_title(f"{technology.upper()} error distribution: {xlabel}")
+    matrix = np.zeros((len(quality_bins), len(depth_bins)))
 
-        fig.tight_layout()
-        fig.savefig(os.path.join(output_path, f"{filename}_errors_histogram.png"),dpi=150,)
-        plt.close(fig)
+    for row, quality_bin in enumerate(quality_bins):
+        for col, depth_bin in enumerate(depth_bins):
+            count = quality_by_depth_counts.get((depth_bin, quality_bin), 0)
+            total = total_by_depth_counts.get(depth_bin, 0)
+
+            if total > 0:
+                matrix[row, col] = count / total
+            else:
+                matrix[row, col] = 0.0
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    im = ax.imshow(matrix, aspect="auto", origin="lower")
+
+    ax.set_xticks(range(len(depth_bins)))
+    ax.set_xticklabels(depth_bins, rotation=45, ha="right")
+
+    ax.set_yticks(range(len(quality_bins)))
+    ax.set_yticklabels(quality_bins)
+
+    ax.set_xlabel("Depth bin")
+    ax.set_ylabel("Base quality bin")
+    ax.set_title(f"{technology.upper()} error distribution: base quality vs depth")
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Proportion of errors")
+
+    fig.tight_layout()
+    fig.savefig(output_path / "base_quality_vs_depth_heatmap.png", dpi=150)
+    plt.close(fig)
+
+
 
 def process_technology(
     mismatches: Iterable[Mismatch],
@@ -172,51 +246,29 @@ def process_technology(
     bam_path: str,
     min_alignment_fraction: float = 0.8,
     min_depth: int = 10,
+    *,
+    min_mapq: int = 0,
+    plot_histograms: bool = True,
+    technology: str | None = None,
+    output_dir: str = "histograms",
 ) -> tuple[list[Mismatch], list[Mismatch]]:
+    """Classify & QC errors; keep VCF variants without minimum-depth filtering.
 
-    errors, variants = classify_mismatches(
-        mismatches,
-        variant_positions,
-    )
+    Call on a bounded window rather than a whole 40+ GB collection.
+    """
+    errors, variants = classify_mismatches(mismatches, variant_positions)
 
-    all_mismatches = errors + variants
-
-    interesting_positions = {
-        (m.chrom, m.ref_pos)
-        for m in all_mismatches
-    }
-
+    interesting_positions = {(m.chrom, m.ref_pos) for m in errors}
     depth = calculate_depth(
         bam_path,
         interesting_positions,
         min_alignment_fraction=min_alignment_fraction,
+        min_mapq=min_mapq,
     )
 
-    for mismatch in all_mismatches:
-        mismatch.depth = depth.get(
-            (mismatch.chrom, mismatch.ref_pos),
-            0,
-        )
+    for mismatch in errors:
+        mismatch.depth = depth.get((mismatch.chrom, mismatch.ref_pos), 0)
 
-    errors = filter_mismatches_by_qc(
-        errors,
-        depth,
-        min_alignment_fraction=min_alignment_fraction,
-        min_depth=min_depth,
-    )
-
-    variants = filter_mismatches_by_qc(
-        variants,
-        depth,
-        min_alignment_fraction=min_alignment_fraction,
-        min_depth=min_depth,
-    )
-
-    plot_error_histograms(
-    errors,
-    technology=all_mismatches[0].technology if all_mismatches else "unknown",
-    output_dir="histograms",
-)
+    errors = filter_mismatches_by_qc(errors,depth,min_alignment_fraction=min_alignment_fraction,min_depth=min_depth,)
 
     return errors, variants
-
