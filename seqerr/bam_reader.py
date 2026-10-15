@@ -10,7 +10,7 @@ from __future__ import annotations
 import csv
 import multiprocessing as mp
 import shutil
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterator, Optional
@@ -31,6 +31,7 @@ class Mismatch:
     cigar: str                 # full CIGAR string of the read
     is_read1: bool
     is_reverse: bool
+    depth: int = 0                # read depth at this position (filled later)
 
     def as_row(self) -> dict:
         return asdict(self)
@@ -43,7 +44,6 @@ def _min_mapq_ok(read: pysam.AlignedSegment, min_mapq: int) -> bool:
     return (
         not read.is_unmapped
         and not read.is_secondary
-        and not read.is_supplementary
         and not read.is_duplicate
         and read.mapping_quality >= min_mapq
     )
@@ -150,7 +150,7 @@ def iter_mismatches(
     technology: str,
     reference_fasta: Optional[str | Path] = None,
     regions: Optional[list[tuple[str, int, int]]] = None,
-    min_mapq: int = 1,
+    min_mapq: int = 0,
     min_base_qual: int = 0,
 ) -> Iterator[Mismatch]:
     fasta = pysam.FastaFile(str(reference_fasta)) if reference_fasta else None
@@ -170,7 +170,7 @@ def iter_mismatches(
 
 def _row(m: Mismatch) -> list:
     return [m.read_name, m.technology, m.chrom, m.ref_pos, m.ref_base, m.read_base,
-            m.base_qual, m.mapping_qual, m.cigar, m.is_read1, m.is_reverse]
+            m.base_qual, m.mapping_qual, m.cigar, m.is_read1, m.is_reverse,m.depth]
 
 
 @dataclass
@@ -178,9 +178,14 @@ class ExtractionResult:
     n_mismatches: int
     n_errors: int
     n_variants: int
-    error_hist: Counter        # base_qual -> count, errors only
+    error_hist: Counter
     errors_csv: Path
     variants_csv: Path
+    weighted_error_hist: dict[int, float] | None = None
+
+    quality_depth_distribution: dict[
+        tuple[int, int], float
+    ] | None = None
 
 
 _W: dict = {}
@@ -206,21 +211,74 @@ def _process_window(task: tuple) -> tuple:
     tmp = Path(_W["tmp_dir"])
     err_path = tmp / f"errors_{idx:06d}.part"
     var_path = tmp / f"variants_{idx:06d}.part"
+
     hist: Counter = Counter()
+    depth_hist: Counter = Counter()
+    mapq_hist: Counter = Counter()
+    quality_by_depth = Counter()
+    total_by_depth = Counter()
+    weighted_quality: dict[int, float] = defaultdict(float)
     n_all = n_err = n_var = 0
+
     with open(err_path, "w", newline="") as fe, open(var_path, "w", newline="") as fv:
         we, wv = csv.writer(fe), csv.writer(fv)
-        for m in _scan_region(bam, fasta, _W["technology"], chrom, start, end,
-                              _W["min_mapq"], _W["min_base_qual"], True):
-            n_all += 1
-            if variants and (m.chrom, m.ref_pos, m.ref_base, m.read_base) in variants:
+        mismatches = _scan_region(
+            bam, fasta, _W["technology"], chrom, start, end,
+            _W["min_mapq"], _W["min_base_qual"], True,
+        )
+
+        if _W["apply_qc"]:
+            # Local import avoids bam_reader <-> mismatch_classify circular imports.
+            from .mismatch_classify import process_technology
+
+            # Only one bounded window is materialized in a worker.
+            window_mismatches = list(mismatches)
+            n_all = len(window_mismatches)
+            errors, variant_records = process_technology(
+                window_mismatches, variants, str(_W["bam_path"]),
+                min_alignment_fraction=_W["min_alignment_fraction"],
+                min_depth=_W["min_depth"],
+                min_mapq=_W["min_mapq"],
+                plot_histograms=False,  # plot ONCE after all windows merge
+            )
+
+            for m in errors:
+                we.writerow(_row(m))
+                n_err += 1
+                hist[m.base_qual] += 1
+                depth_hist[m.depth] += 1
+                mapq_hist[m.mapping_qual] += 1
+                if m.depth > 0:
+                    weighted_quality[m.base_qual] += 1.0 / m.depth
+
+                depth_bin = (m.depth // 10) * 10
+                quality_bin = (m.base_qual // 10) * 10
+                quality_by_depth[(depth_bin, quality_bin)] += 1
+                total_by_depth[depth_bin] += 1
+
+            for m in variant_records:
                 wv.writerow(_row(m))
                 n_var += 1
-            else:
-                we.writerow(_row(m))
-                hist[m.base_qual] += 1
-                n_err += 1
-    return idx, n_all, n_err, n_var, hist, str(err_path), str(var_path)
+
+        else:
+            # Original streaming extraction path, unchanged unless QC enabled.
+            for m in mismatches:
+                n_all += 1
+                if variants and (m.chrom, m.ref_pos, m.ref_base, m.read_base) in variants:
+                    wv.writerow(_row(m))
+                    n_var += 1
+                else:
+                    we.writerow(_row(m))
+                    hist[m.base_qual] += 1
+                    n_err += 1
+
+    return (idx, n_all, n_err, n_var, hist,
+            str(err_path), str(var_path),
+            depth_hist, mapq_hist,
+            dict(weighted_quality),
+            quality_by_depth,
+            total_by_depth,
+        )
 
 
 def plan_windows(bam_path: str | Path, window_size: int) -> list[tuple[int, str, int, int]]:
@@ -244,10 +302,14 @@ def extract_errors_parallel(
     variants_csv: str | Path,
     reference_fasta: Optional[str | Path] = None,
     variant_positions: Optional[set] = None,
-    min_mapq: int = 1,
+    min_mapq: int = 0,
     min_base_qual: int = 0,
     threads: int = 1,
     window_size: int = 5_000_000,
+    apply_qc: bool = False,
+    min_alignment_fraction: float = 0.8,
+    min_depth: int = 10,
+    histograms_dir: str = "histograms",
 ) -> ExtractionResult:
     errors_csv, variants_csv = Path(errors_csv), Path(variants_csv)
     errors_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +320,9 @@ def extract_errors_parallel(
     windows = plan_windows(bam_path, window_size)
     cfg = dict(bam_path=str(bam_path), reference=str(reference_fasta) if reference_fasta else None,
                technology=technology, variant_positions=variant_positions or set(),
-               min_mapq=min_mapq, min_base_qual=min_base_qual, tmp_dir=str(tmp_dir))
+               min_mapq=min_mapq, min_base_qual=min_base_qual, tmp_dir=str(tmp_dir),
+               apply_qc=apply_qc, min_alignment_fraction=min_alignment_fraction,
+               min_depth=min_depth)
 
     results: dict[int, tuple] = {}
     try:
@@ -284,6 +348,11 @@ def extract_errors_parallel(
                               flush=True)
 
         hist: Counter = Counter()
+        depth_hist: Counter = Counter()
+        mapq_hist: Counter = Counter()
+        quality_by_depth_all = Counter()
+        total_by_depth_all = Counter()
+        weighted_quality: dict[int, float] = defaultdict(float)
         n_all = n_err = n_var = 0
         for out_path, kind in ((errors_csv, 5), (variants_csv, 6)):
             with open(out_path, "w", newline="") as out:
@@ -294,13 +363,48 @@ def extract_errors_parallel(
                         shutil.copyfileobj(src, out, 1 << 20)
                     part.unlink()
         for idx in sorted(results):
-            _, a, e, v, h, _, _ = results[idx]
+            (_, a, e, v, h, _, _, depth_counts, mapq_counts, quality_weights, window_quality_by_depth, window_total_by_depth) = results[idx]
             n_all += a; n_err += e; n_var += v
             hist.update(h)
+            depth_hist.update(depth_counts)
+            mapq_hist.update(mapq_counts)
+            quality_by_depth_all.update(window_quality_by_depth)
+            total_by_depth_all.update(window_total_by_depth)
+            
+            for q, weight in quality_weights.items():
+                weighted_quality[q] += weight
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return ExtractionResult(n_all, n_err, n_var, hist, errors_csv, variants_csv)
+    distribution = {}
+
+    for (depth_bin, quality_bin), count in quality_by_depth_all.items():
+
+        distribution[(depth_bin, quality_bin)] = (count / total_by_depth_all[depth_bin])
+
+    #print(distribution)
+       
+    if apply_qc:
+        from .mismatch_classify import (
+            #plot_error_histograms_from_counts,
+            plot_quality_depth_heatmap_from_counts,
+        )
+        """
+        plot_error_histograms_from_counts(
+            hist, depth_hist, mapq_hist, dict(weighted_quality),
+            technology, histograms_dir,
+        )
+        """
+        plot_quality_depth_heatmap_from_counts(
+            quality_by_depth_all,
+            total_by_depth_all,
+            technology,
+            histograms_dir,
+        )
+
+    return ExtractionResult(n_all, n_err, n_var, hist, errors_csv, variants_csv, weighted_error_hist=(dict(weighted_quality) if apply_qc else None),
+        quality_depth_distribution=(distribution if apply_qc else None),
+    )
 
 
 def _collect_window(task: tuple) -> list[Mismatch]:
@@ -314,7 +418,7 @@ def iter_mismatches_parallel(
     bam_path: str | Path,
     technology: str,
     reference_fasta: Optional[str | Path] = None,
-    min_mapq: int = 1,
+    min_mapq: int = 0,
     min_base_qual: int = 0,
     threads: int = 1,
     window_size: int = 5_000_000,
