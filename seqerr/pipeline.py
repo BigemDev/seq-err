@@ -14,10 +14,11 @@ from pathlib import Path
 
 from .run_all import map_paired_bwa_mem
 from .bam_reader import iter_mismatches_parallel, extract_errors_parallel
-from .vcf_reader import load_variant_positions
+from .vcf_reader import load_variant_positions, variant_sites
 from .mismatch_classify import classify_mismatches
 from .bqsr_compare import compare_bqsr, dropped_after_bqsr, write_bqsr_deltas_csv
 from .quality_stats import QualityDistribution, summarize_comparison
+from .calibration import Calibration, summarize_calibration
 
 
 def cmd_map(args: argparse.Namespace) -> None:
@@ -41,6 +42,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
     variant_positions = (
         load_variant_positions(args.vcf, threads=args.threads) if args.vcf else set()
     )
+    sites = variant_sites(variant_positions)
     res = extract_errors_parallel(
         bam_path=args.bam,
         technology=args.technology,
@@ -48,6 +50,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         variants_csv=out_dir / "variants.csv",
         reference_fasta=args.reference,
         variant_positions=variant_positions,
+        variant_sites=sites,
         min_mapq=args.min_mapq,
         min_base_qual=args.min_base_qual,
         threads=args.threads,
@@ -56,6 +59,9 @@ def cmd_extract(args: argparse.Namespace) -> None:
     print(f"[extract] {res.n_mismatches} raw mismatches found")
     print(f"[extract] {res.n_errors} sequencing errors -> {out_dir/'errors.csv'}")
     print(f"[extract] {res.n_variants} known variants   -> {out_dir/'variants.csv'}")
+    calibration = Calibration(args.technology, res.calib_total_hist, res.calib_error_hist)
+    calibration.write_csv(out_dir / "calibration.csv")
+    print(summarize_calibration({args.technology: calibration}))
 
 
 def _qual_histogram_from_csv(path: str | Path) -> Counter:

@@ -6,6 +6,7 @@ Loads variant positions from a VCF/BCF file, used to distinguish known variants 
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -29,3 +30,12 @@ def load_variant_positions(
             for alt in rec.alts or ():
                 positions.add((rec.chrom, rec.pos, rec.ref, alt))
     return positions
+
+
+def variant_sites(*position_sets: set[tuple[str, int, str, str]]) -> dict[str, list[int]]:
+    """Return sorted, unique 1-based positions covered by VCF REF alleles."""
+    sites: dict[str, set[int]] = defaultdict(set)
+    for positions in position_sets:
+        for chrom, pos, ref, _ in positions:
+            sites[chrom].update(range(pos, pos + len(ref)))
+    return {chrom: sorted(positions) for chrom, positions in sites.items()}

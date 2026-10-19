@@ -12,8 +12,9 @@ from typing import Optional
 import pysam
 
 from .bam_reader import extract_errors_parallel
-from .vcf_reader import load_variant_positions
+from .vcf_reader import load_variant_positions, variant_sites
 from .quality_stats import QualityDistribution, summarize_comparison
+from .calibration import Calibration, plot_calibration, summarize_calibration
 
 
 @dataclass
@@ -26,6 +27,7 @@ class TechnologyResult:
     errors_csv: Path
     variants_csv: Path
     distribution: QualityDistribution
+    calibration: Calibration
 
 
 _BWA_INDEX_EXT = (".amb", ".ann", ".bwt", ".pac", ".sa")
@@ -231,6 +233,7 @@ def _extract_and_classify(
     out_dir: Path,
     reference: Optional[str],
     variant_positions: set,
+    sites: dict[str, list[int]],
     min_mapq: int,
     min_base_qual: int,
     threads: int = 1,
@@ -248,6 +251,7 @@ def _extract_and_classify(
         variants_csv=variants_csv,
         reference_fasta=reference,
         variant_positions=variant_positions,
+        variant_sites=sites,
         min_mapq=min_mapq,
         min_base_qual=min_base_qual,
         threads=threads,
@@ -256,6 +260,8 @@ def _extract_and_classify(
 
     dist = QualityDistribution.from_histogram(label, res.error_hist)
     dist.write_histogram_csv(tech_dir / "error_qual_histogram.csv")
+    calibration = Calibration(label, res.calib_total_hist, res.calib_error_hist)
+    calibration.write_csv(tech_dir / "calibration.csv")
 
     print(f"[{label}] {res.n_mismatches} raw mismatches "
           f"-> {res.n_errors} errors, {res.n_variants} known variants")
@@ -269,6 +275,7 @@ def _extract_and_classify(
         errors_csv=errors_csv,
         variants_csv=variants_csv,
         distribution=dist,
+        calibration=calibration,
     )
 
 
@@ -350,11 +357,14 @@ def run_all(
     variant_positions_a, variant_positions_b = _variant_positions_for_samples(
         auto_gatk, reference, out_dir, label_a, label_b, bam_path_a, bam_path_b,
         vcf, vcf_a, vcf_b, consensus, threads, hc_chunk_mb, gatk_java_options)
+    sites = variant_sites(variant_positions_a, variant_positions_b)
 
-    result_a = _extract_and_classify(label_a, bam_path_a, out_dir, reference, variant_positions_a,
-                                     min_mapq, min_base_qual, threads, extract_window_mb)
-    result_b = _extract_and_classify(label_b, bam_path_b, out_dir, reference, variant_positions_b,
-                                     min_mapq, min_base_qual, threads, extract_window_mb)
+    result_a = _extract_and_classify(
+        label_a, bam_path_a, out_dir, reference, variant_positions_a, sites,
+        min_mapq, min_base_qual, threads, extract_window_mb)
+    result_b = _extract_and_classify(
+        label_b, bam_path_b, out_dir, reference, variant_positions_b, sites,
+        min_mapq, min_base_qual, threads, extract_window_mb)
 
     _write_summary(out_dir, label_a, label_b, result_a, result_b)
     return result_a, result_b
@@ -404,6 +414,9 @@ def _variant_positions_for_samples(
 def _write_summary(out_dir, label_a, label_b, result_a, result_b):
     summary = summarize_comparison({label_a: result_a.distribution,
                                     label_b: result_b.distribution})
+    calibrations = {label_a: result_a.calibration, label_b: result_b.calibration}
+    summary += "\n\n" + summarize_calibration(calibrations)
+    plot_calibration(calibrations, out_dir / "calibration.png")
     summary_path = out_dir / "comparison_summary.txt"
     summary_path.write_text(summary + "\n")
     print()

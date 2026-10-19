@@ -10,7 +10,8 @@ from __future__ import annotations
 import csv
 import multiprocessing as mp
 import shutil
-from collections import Counter, defaultdict
+from bisect import bisect_left
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterator, Optional
@@ -31,7 +32,6 @@ class Mismatch:
     cigar: str                 # full CIGAR string of the read
     is_read1: bool
     is_reverse: bool
-    depth: int = 0                # read depth at this position (filled later)
 
     def as_row(self) -> dict:
         return asdict(self)
@@ -39,16 +39,12 @@ class Mismatch:
 
 CSV_FIELDS = list(Mismatch.__dataclass_fields__.keys())
 
-# Identical bins for numerator and denominator of the empirical heatmap.
-DEPTH_BIN_SIZE = 5
-QUALITY_BIN_SIZE = 5
-
 
 def _min_mapq_ok(read: pysam.AlignedSegment, min_mapq: int) -> bool:
     return (
         not read.is_unmapped
         and not read.is_secondary
-	and not read.is_supplementary
+        and not read.is_supplementary
         and not read.is_duplicate
         and read.mapping_quality >= min_mapq
     )
@@ -65,16 +61,17 @@ def _read_mismatches(
     ref_offset: int,
     technology: str,
     min_base_qual: int,
+    calib_total_hist: Optional[Counter] = None,
+    calib_error_hist: Optional[Counter] = None,
+    variant_sites: Optional[dict[str, list[int]]] = None,
 ) -> Iterator[Mismatch]:
     seq = read.query_sequence
     quals = read.query_qualities
     chrom = read.reference_name
 
-    if ref_seq is None:
-        pairs = ((q, r, b) for q, r, b in read.get_aligned_pairs(with_seq=True, matches_only=False)
-                 if q is not None and r is not None)
-    else:
-        pairs = None
+    ref_seq_is_md = ref_seq is None
+    if ref_seq_is_md:
+        ref_seq = read.get_reference_sequence().upper()
 
     def make(qpos, rpos, ref_base):
         read_base = seq[qpos].upper()
@@ -83,6 +80,9 @@ def _read_mismatches(
         bq = quals[qpos]
         if bq < min_base_qual:
             return None
+        if (calib_error_hist is not None and read_base != "N" and
+                not _is_variant_site(variant_positions, rpos + 1)):
+            calib_error_hist[bq] += 1
         return Mismatch(
             read_name=read.query_name,
             technology=technology,
@@ -97,19 +97,37 @@ def _read_mismatches(
             is_reverse=read.is_reverse,
         )
 
-    if pairs is not None:
-        for qpos, rpos, rb in pairs:
-            m = make(qpos, rpos, rb.upper())
-            if m is not None:
-                yield m
-        return
-
+    variant_positions = (variant_sites or {}).get(chrom, [])
     qpos = 0
     rpos = read.reference_start
+    md_pos = 0
     useq = seq.upper()
     for op, length in read.cigartuples or ():
         if op in _CIGAR_ALIGNED:
-            rslice = ref_seq[rpos - ref_offset: rpos - ref_offset + length].upper()
+            ref_start = md_pos if ref_seq_is_md else rpos - ref_offset
+            rslice = ref_seq[ref_start:ref_start + length].upper()
+            read_slice = useq[qpos:qpos + length]
+            if calib_total_hist is not None:
+                first_site = bisect_left(variant_positions, rpos + 1)
+                has_site = (first_site < len(variant_positions) and
+                            variant_positions[first_site] <= rpos + length)
+                if not has_site and not rslice.strip("ACGT") and not read_slice.strip("ACGT"):
+                    for q, count in Counter(quals[qpos:qpos + length]).items():
+                        if q >= min_base_qual:
+                            calib_total_hist[q] += count
+                else:
+                    site_index = first_site
+                    for i, (ref_base, read_base, bq) in enumerate(
+                            zip(rslice, read_slice, quals[qpos:qpos + length])):
+                        pos1 = rpos + i + 1
+                        while (site_index < len(variant_positions) and
+                               variant_positions[site_index] < pos1):
+                            site_index += 1
+                        at_site = (site_index < len(variant_positions) and
+                                   variant_positions[site_index] == pos1)
+                        if (bq >= min_base_qual and ref_base in "ACGT" and
+                                read_base != "N" and not at_site):
+                            calib_total_hist[bq] += 1
             if rslice != useq[qpos:qpos + length]:
                 for i in range(length):
                     m = make(qpos + i, rpos + i, rslice[i])
@@ -117,10 +135,19 @@ def _read_mismatches(
                         yield m
             qpos += length
             rpos += length
+            if ref_seq_is_md:
+                md_pos += length
         elif op in _CIGAR_QUERY_ONLY:
             qpos += length
         elif op in _CIGAR_REF_ONLY:
             rpos += length
+            if ref_seq_is_md and op == 2:  # MD includes deletions but not reference skips.
+                md_pos += length
+
+
+def _is_variant_site(positions: list[int], pos: int) -> bool:
+    i = bisect_left(positions, pos)
+    return i < len(positions) and positions[i] == pos
 
 
 def _scan_region(
@@ -133,6 +160,9 @@ def _scan_region(
     min_mapq: int,
     min_base_qual: int,
     own_reads_only: bool,
+    calib_total_hist: Optional[Counter] = None,
+    calib_error_hist: Optional[Counter] = None,
+    variant_sites: Optional[dict[str, list[int]]] = None,
 ) -> Iterator[Mismatch]:
     reads = bam.fetch(chrom, start, end) if chrom is not None else bam.fetch()
     for read in reads:
@@ -147,7 +177,8 @@ def _scan_region(
             ref_seq = fasta.fetch(read.reference_name, read.reference_start,
                                   read.reference_end)
         yield from _read_mismatches(read, ref_seq, read.reference_start,
-                                    technology, min_base_qual)
+                                    technology, min_base_qual,
+                                    calib_total_hist, calib_error_hist, variant_sites)
 
 
 def iter_mismatches(
@@ -155,7 +186,7 @@ def iter_mismatches(
     technology: str,
     reference_fasta: Optional[str | Path] = None,
     regions: Optional[list[tuple[str, int, int]]] = None,
-    min_mapq: int = 20,
+    min_mapq: int = 1,
     min_base_qual: int = 0,
 ) -> Iterator[Mismatch]:
     fasta = pysam.FastaFile(str(reference_fasta)) if reference_fasta else None
@@ -175,7 +206,7 @@ def iter_mismatches(
 
 def _row(m: Mismatch) -> list:
     return [m.read_name, m.technology, m.chrom, m.ref_pos, m.ref_base, m.read_base,
-            m.base_qual, m.mapping_qual, m.cigar, m.is_read1, m.is_reverse,m.depth]
+            m.base_qual, m.mapping_qual, m.cigar, m.is_read1, m.is_reverse]
 
 
 @dataclass
@@ -183,15 +214,11 @@ class ExtractionResult:
     n_mismatches: int
     n_errors: int
     n_variants: int
-    error_hist: Counter
+    error_hist: Counter        # base_qual -> count, errors only
     errors_csv: Path
     variants_csv: Path
-    weighted_error_hist: dict[int, float] | None = None
-    rate_plots: list[Path] | None = None
-
-    quality_depth_distribution: dict[
-        tuple[int, int], float
-    ] | None = None
+    calib_total_hist: Counter
+    calib_error_hist: Counter
 
 
 _W: dict = {}
@@ -217,116 +244,26 @@ def _process_window(task: tuple) -> tuple:
     tmp = Path(_W["tmp_dir"])
     err_path = tmp / f"errors_{idx:06d}.part"
     var_path = tmp / f"variants_{idx:06d}.part"
-
     hist: Counter = Counter()
-    depth_hist: Counter = Counter()
-    mapq_hist: Counter = Counter()
-    quality_by_depth = Counter()
-    total_by_depth = Counter()
-    rate_qual_errors = Counter()
-    rate_depth_errors = Counter()
-    rate_qual_bases = Counter()
-    rate_depth_bases = Counter()
-    rate_joint_errors = Counter()
-    rate_joint_bases = Counter()
-    weighted_quality: dict[int, float] = defaultdict(float)
+    calib_total_hist: Counter = Counter()
+    calib_error_hist: Counter = Counter()
     n_all = n_err = n_var = 0
-
     with open(err_path, "w", newline="") as fe, open(var_path, "w", newline="") as fv:
         we, wv = csv.writer(fe), csv.writer(fv)
-        mismatches = _scan_region(
-            bam, fasta, _W["technology"], chrom, start, end,
-            _W["min_mapq"], _W["min_base_qual"], True,
-        )
-
-        if _W["apply_qc"]:
-            # Local import avoids bam_reader <-> mismatch_classify circular imports.
-            from .mismatch_classify import process_technology
-
-            # Only one bounded window is materialized in a worker.
-            window_mismatches = list(mismatches)
-            n_all = len(window_mismatches)
-            errors, variant_records = process_technology(
-                window_mismatches,
-    		variants,
-    		str(_W["bam_path"]),
-    		min_alignment_fraction=_W["min_alignment_fraction"],
-    		min_depth=_W["min_depth"],
-    		min_mapq=_W["min_mapq"],
-            )
-
-            if _W["compute_error_rates"]:
-                from .mismatch_classify import count_rate_denominators
-                rate_qual_bases, rate_depth_bases, rate_joint_bases = count_rate_denominators(
-                    bam=bam,
-                    fasta=fasta,
-                    chrom=chrom,
-                    start=start,
-                    end=end,
-                    variant_loci=_W["variant_loci"],
-                    min_mapq=_W["min_mapq"],
-                    min_alignment_fraction=_W["min_alignment_fraction"],
-                    min_depth=_W["min_depth"],
-                    min_base_qual=_W["min_base_qual"],
-                    depth_bin_size=DEPTH_BIN_SIZE,
-                    quality_bin_size=QUALITY_BIN_SIZE,
-                )
-
-            for m in errors:
-                we.writerow(_row(m))
-                n_err += 1
-                hist[m.base_qual] += 1
-                depth_hist[m.depth] += 1
-                mapq_hist[m.mapping_qual] += 1
-                if m.depth > 0:
-                    weighted_quality[m.base_qual] += 1.0 / m.depth
-
-                depth_bin = (m.depth // DEPTH_BIN_SIZE) * DEPTH_BIN_SIZE
-                quality_bin = (m.base_qual // QUALITY_BIN_SIZE) * QUALITY_BIN_SIZE
-                quality_by_depth[(depth_bin, quality_bin)] += 1
-                total_by_depth[depth_bin] += 1
-
-                if _W["compute_error_rates"]:
-                    # The denominator masks entire known-variant loci.
-                    # Apply exactly the same mask to rate numerators.
-                    if (m.chrom, m.ref_pos) not in _W["variant_loci"]:
-                        rate_qual_errors[m.base_qual] += 1
-                        rate_depth_errors[m.depth] += 1
-                        joint_key = (
-                            (m.depth // DEPTH_BIN_SIZE) * DEPTH_BIN_SIZE,
-                            (m.base_qual // QUALITY_BIN_SIZE) * QUALITY_BIN_SIZE,
-                        )
-                        rate_joint_errors[joint_key] += 1
-
-            for m in variant_records:
+        for m in _scan_region(bam, fasta, _W["technology"], chrom, start, end,
+                              _W["min_mapq"], _W["min_base_qual"], True,
+                              calib_total_hist, calib_error_hist,
+                              _W["variant_sites"]):
+            n_all += 1
+            if variants and (m.chrom, m.ref_pos, m.ref_base, m.read_base) in variants:
                 wv.writerow(_row(m))
                 n_var += 1
-
-        else:
-            # Original streaming extraction path, unchanged unless QC enabled.
-            for m in mismatches:
-                n_all += 1
-                if variants and (m.chrom, m.ref_pos, m.ref_base, m.read_base) in variants:
-                    wv.writerow(_row(m))
-                    n_var += 1
-                else:
-                    we.writerow(_row(m))
-                    hist[m.base_qual] += 1
-                    n_err += 1
-
-    return (idx, n_all, n_err, n_var, hist,
-            str(err_path), str(var_path),
-            depth_hist, mapq_hist,
-            dict(weighted_quality),
-            quality_by_depth,
-            total_by_depth,
-            rate_qual_errors,
-            rate_depth_errors,
-            rate_qual_bases,
-            rate_depth_bases,
-            rate_joint_errors,
-            rate_joint_bases,
-        )
+            else:
+                we.writerow(_row(m))
+                hist[m.base_qual] += 1
+                n_err += 1
+    return (idx, n_all, n_err, n_var, hist, str(err_path), str(var_path),
+            calib_total_hist, calib_error_hist)
 
 
 def plan_windows(bam_path: str | Path, window_size: int) -> list[tuple[int, str, int, int]]:
@@ -350,21 +287,12 @@ def extract_errors_parallel(
     variants_csv: str | Path,
     reference_fasta: Optional[str | Path] = None,
     variant_positions: Optional[set] = None,
-    min_mapq: int = 20,
+    min_mapq: int = 1,
     min_base_qual: int = 0,
     threads: int = 1,
     window_size: int = 5_000_000,
-    apply_qc: bool = False,
-    min_alignment_fraction: float = 0.8,
-    min_depth: int = 10,
-    histograms_dir: str = "histograms",
-    compute_error_rates: bool = False,
+    variant_sites: Optional[dict[str, list[int]]] = None,
 ) -> ExtractionResult:
-    if compute_error_rates and not apply_qc:
-        raise ValueError("compute_error_rates=True requires apply_qc=True")
-    if compute_error_rates and reference_fasta is None:
-        raise ValueError("Error-rate denominators require reference_fasta (indexed .fa/.fai)")
-
     errors_csv, variants_csv = Path(errors_csv), Path(variants_csv)
     errors_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = errors_csv.parent / f".{errors_csv.stem}_parts"
@@ -375,15 +303,7 @@ def extract_errors_parallel(
     cfg = dict(bam_path=str(bam_path), reference=str(reference_fasta) if reference_fasta else None,
                technology=technology, variant_positions=variant_positions or set(),
                min_mapq=min_mapq, min_base_qual=min_base_qual, tmp_dir=str(tmp_dir),
-               apply_qc=apply_qc, min_alignment_fraction=min_alignment_fraction,
-               min_depth=min_depth, compute_error_rates=compute_error_rates)
-
-    if compute_error_rates:
-        # Precompute once, not separately for every genomic window.
-        variant_loci = {(c, p) for c, p, _, _ in (variant_positions or set())}
-        cfg["variant_loci"] = variant_loci
-    else:
-        cfg["variant_loci"] = set()
+               variant_sites=variant_sites or {})
 
     results: dict[int, tuple] = {}
     try:
@@ -409,17 +329,8 @@ def extract_errors_parallel(
                               flush=True)
 
         hist: Counter = Counter()
-        depth_hist: Counter = Counter()
-        mapq_hist: Counter = Counter()
-        quality_by_depth_all = Counter()
-        total_by_depth_all = Counter()
-        weighted_quality: dict[int, float] = defaultdict(float)
-        rate_qual_errors_all = Counter()
-        rate_depth_errors_all = Counter()
-        rate_qual_bases_all = Counter()
-        rate_depth_bases_all = Counter()
-        rate_joint_errors_all = Counter()
-        rate_joint_bases_all = Counter()
+        calib_total_hist: Counter = Counter()
+        calib_error_hist: Counter = Counter()
         n_all = n_err = n_var = 0
         for out_path, kind in ((errors_csv, 5), (variants_csv, 6)):
             with open(out_path, "w", newline="") as out:
@@ -430,87 +341,16 @@ def extract_errors_parallel(
                         shutil.copyfileobj(src, out, 1 << 20)
                     part.unlink()
         for idx in sorted(results):
-            (
-                _, a, e, v, h, _, _, depth_counts, mapq_counts,
-                quality_weights, window_quality_by_depth, window_total_by_depth,
-                window_rate_qual_errors, window_rate_depth_errors,
-                window_rate_qual_bases, window_rate_depth_bases,
-                window_rate_joint_errors, window_rate_joint_bases,
-            ) = results[idx]
+            _, a, e, v, h, _, _, total_hist, error_hist = results[idx]
             n_all += a; n_err += e; n_var += v
             hist.update(h)
-            depth_hist.update(depth_counts)
-            mapq_hist.update(mapq_counts)
-            quality_by_depth_all.update(window_quality_by_depth)
-            total_by_depth_all.update(window_total_by_depth)
-            rate_qual_errors_all.update(window_rate_qual_errors)
-            rate_depth_errors_all.update(window_rate_depth_errors)
-            rate_qual_bases_all.update(window_rate_qual_bases)
-            rate_depth_bases_all.update(window_rate_depth_bases)
-            rate_joint_errors_all.update(window_rate_joint_errors)
-            rate_joint_bases_all.update(window_rate_joint_bases)
-            
-            for q, weight in quality_weights.items():
-                weighted_quality[q] += weight
+            calib_total_hist.update(total_hist)
+            calib_error_hist.update(error_hist)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    if apply_qc:
-        if sum(quality_by_depth_all.values()) != n_err:
-            raise RuntimeError("Quality-depth counts disagree with filtered error count")
-        if sum(total_by_depth_all.values()) != n_err:
-            raise RuntimeError("Depth counts disagree with filtered error count")
-    if compute_error_rates:
-        if sum(rate_qual_errors_all.values()) != sum(rate_depth_errors_all.values()):
-            raise RuntimeError("Rate error numerators disagree")
-        if sum(rate_qual_bases_all.values()) != sum(rate_depth_bases_all.values()):
-            raise RuntimeError("Rate denominators disagree")
-        if sum(rate_joint_errors_all.values()) != sum(rate_qual_errors_all.values()):
-            raise RuntimeError("Joint error numerators disagree")
-        if sum(rate_joint_bases_all.values()) != sum(rate_qual_bases_all.values()):
-            raise RuntimeError("Joint rate denominators disagree")
-
-    distribution = {
-        (d, q): count / total_by_depth_all[d]
-        for (d, q), count in quality_by_depth_all.items()
-    } if apply_qc else None
-       
-    written_rate_plots = None
-    if compute_error_rates:
-        from .plots import plot_error_rates
-        # Each denominator includes reference positions without mismatches.
-        written_rate_plots = plot_error_rates(
-            label=technology,
-            error_hist=rate_qual_errors_all,
-            total_qual=rate_qual_bases_all,
-            error_depth=rate_depth_errors_all,
-            total_depth_bases=rate_depth_bases_all,
-            out_dir=Path(histograms_dir) / technology,
-        )
-
-    # A true error-rate heatmap requires denominators across ALL eligible bases.
-    # With --qc only, those denominators do not exist, so do not draw the old
-    # conditional quality distribution under the same filename.
-    if compute_error_rates:
-        from .plots import plot_quality_depth_heatmap_from_counts
-        heatmap_path = plot_quality_depth_heatmap_from_counts(
-            rate_joint_errors_all,
-            rate_joint_bases_all,
-            technology,
-            histograms_dir,
-        )
-        if heatmap_path is not None:
-            written_rate_plots.extend([
-                heatmap_path.parent / "error_rate_by_quality_depth.csv",
-                heatmap_path,
-            ])
-
-    return ExtractionResult(
-        n_all, n_err, n_var, hist, errors_csv, variants_csv,
-        weighted_error_hist=(dict(weighted_quality) if apply_qc else None),
-        rate_plots=written_rate_plots,
-        quality_depth_distribution=distribution,
-    )
+    return ExtractionResult(n_all, n_err, n_var, hist, errors_csv, variants_csv,
+                            calib_total_hist, calib_error_hist)
 
 
 def _collect_window(task: tuple) -> list[Mismatch]:
@@ -524,7 +364,7 @@ def iter_mismatches_parallel(
     bam_path: str | Path,
     technology: str,
     reference_fasta: Optional[str | Path] = None,
-    min_mapq: int = 20,
+    min_mapq: int = 1,
     min_base_qual: int = 0,
     threads: int = 1,
     window_size: int = 5_000_000,
@@ -545,4 +385,3 @@ def iter_mismatches_parallel(
                   initargs=(cfg,)) as pool:
         for chunk in pool.imap(_collect_window, windows):   # ordered
             yield from chunk
-
