@@ -39,11 +39,16 @@ class Mismatch:
 
 CSV_FIELDS = list(Mismatch.__dataclass_fields__.keys())
 
+# Identical bins for numerator and denominator of the empirical heatmap.
+DEPTH_BIN_SIZE = 5
+QUALITY_BIN_SIZE = 5
+
 
 def _min_mapq_ok(read: pysam.AlignedSegment, min_mapq: int) -> bool:
     return (
         not read.is_unmapped
         and not read.is_secondary
+	and not read.is_supplementary
         and not read.is_duplicate
         and read.mapping_quality >= min_mapq
     )
@@ -150,7 +155,7 @@ def iter_mismatches(
     technology: str,
     reference_fasta: Optional[str | Path] = None,
     regions: Optional[list[tuple[str, int, int]]] = None,
-    min_mapq: int = 0,
+    min_mapq: int = 20,
     min_base_qual: int = 0,
 ) -> Iterator[Mismatch]:
     fasta = pysam.FastaFile(str(reference_fasta)) if reference_fasta else None
@@ -182,6 +187,7 @@ class ExtractionResult:
     errors_csv: Path
     variants_csv: Path
     weighted_error_hist: dict[int, float] | None = None
+    rate_plots: list[Path] | None = None
 
     quality_depth_distribution: dict[
         tuple[int, int], float
@@ -217,6 +223,12 @@ def _process_window(task: tuple) -> tuple:
     mapq_hist: Counter = Counter()
     quality_by_depth = Counter()
     total_by_depth = Counter()
+    rate_qual_errors = Counter()
+    rate_depth_errors = Counter()
+    rate_qual_bases = Counter()
+    rate_depth_bases = Counter()
+    rate_joint_errors = Counter()
+    rate_joint_bases = Counter()
     weighted_quality: dict[int, float] = defaultdict(float)
     n_all = n_err = n_var = 0
 
@@ -235,12 +247,30 @@ def _process_window(task: tuple) -> tuple:
             window_mismatches = list(mismatches)
             n_all = len(window_mismatches)
             errors, variant_records = process_technology(
-                window_mismatches, variants, str(_W["bam_path"]),
-                min_alignment_fraction=_W["min_alignment_fraction"],
-                min_depth=_W["min_depth"],
-                min_mapq=_W["min_mapq"],
-                plot_histograms=False,  # plot ONCE after all windows merge
+                window_mismatches,
+    		variants,
+    		str(_W["bam_path"]),
+    		min_alignment_fraction=_W["min_alignment_fraction"],
+    		min_depth=_W["min_depth"],
+    		min_mapq=_W["min_mapq"],
             )
+
+            if _W["compute_error_rates"]:
+                from .mismatch_classify import count_rate_denominators
+                rate_qual_bases, rate_depth_bases, rate_joint_bases = count_rate_denominators(
+                    bam=bam,
+                    fasta=fasta,
+                    chrom=chrom,
+                    start=start,
+                    end=end,
+                    variant_loci=_W["variant_loci"],
+                    min_mapq=_W["min_mapq"],
+                    min_alignment_fraction=_W["min_alignment_fraction"],
+                    min_depth=_W["min_depth"],
+                    min_base_qual=_W["min_base_qual"],
+                    depth_bin_size=DEPTH_BIN_SIZE,
+                    quality_bin_size=QUALITY_BIN_SIZE,
+                )
 
             for m in errors:
                 we.writerow(_row(m))
@@ -251,10 +281,22 @@ def _process_window(task: tuple) -> tuple:
                 if m.depth > 0:
                     weighted_quality[m.base_qual] += 1.0 / m.depth
 
-                depth_bin = (m.depth // 10) * 10
-                quality_bin = (m.base_qual // 10) * 10
+                depth_bin = (m.depth // DEPTH_BIN_SIZE) * DEPTH_BIN_SIZE
+                quality_bin = (m.base_qual // QUALITY_BIN_SIZE) * QUALITY_BIN_SIZE
                 quality_by_depth[(depth_bin, quality_bin)] += 1
                 total_by_depth[depth_bin] += 1
+
+                if _W["compute_error_rates"]:
+                    # The denominator masks entire known-variant loci.
+                    # Apply exactly the same mask to rate numerators.
+                    if (m.chrom, m.ref_pos) not in _W["variant_loci"]:
+                        rate_qual_errors[m.base_qual] += 1
+                        rate_depth_errors[m.depth] += 1
+                        joint_key = (
+                            (m.depth // DEPTH_BIN_SIZE) * DEPTH_BIN_SIZE,
+                            (m.base_qual // QUALITY_BIN_SIZE) * QUALITY_BIN_SIZE,
+                        )
+                        rate_joint_errors[joint_key] += 1
 
             for m in variant_records:
                 wv.writerow(_row(m))
@@ -278,6 +320,12 @@ def _process_window(task: tuple) -> tuple:
             dict(weighted_quality),
             quality_by_depth,
             total_by_depth,
+            rate_qual_errors,
+            rate_depth_errors,
+            rate_qual_bases,
+            rate_depth_bases,
+            rate_joint_errors,
+            rate_joint_bases,
         )
 
 
@@ -302,7 +350,7 @@ def extract_errors_parallel(
     variants_csv: str | Path,
     reference_fasta: Optional[str | Path] = None,
     variant_positions: Optional[set] = None,
-    min_mapq: int = 0,
+    min_mapq: int = 20,
     min_base_qual: int = 0,
     threads: int = 1,
     window_size: int = 5_000_000,
@@ -310,7 +358,13 @@ def extract_errors_parallel(
     min_alignment_fraction: float = 0.8,
     min_depth: int = 10,
     histograms_dir: str = "histograms",
+    compute_error_rates: bool = False,
 ) -> ExtractionResult:
+    if compute_error_rates and not apply_qc:
+        raise ValueError("compute_error_rates=True requires apply_qc=True")
+    if compute_error_rates and reference_fasta is None:
+        raise ValueError("Error-rate denominators require reference_fasta (indexed .fa/.fai)")
+
     errors_csv, variants_csv = Path(errors_csv), Path(variants_csv)
     errors_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = errors_csv.parent / f".{errors_csv.stem}_parts"
@@ -322,7 +376,14 @@ def extract_errors_parallel(
                technology=technology, variant_positions=variant_positions or set(),
                min_mapq=min_mapq, min_base_qual=min_base_qual, tmp_dir=str(tmp_dir),
                apply_qc=apply_qc, min_alignment_fraction=min_alignment_fraction,
-               min_depth=min_depth)
+               min_depth=min_depth, compute_error_rates=compute_error_rates)
+
+    if compute_error_rates:
+        # Precompute once, not separately for every genomic window.
+        variant_loci = {(c, p) for c, p, _, _ in (variant_positions or set())}
+        cfg["variant_loci"] = variant_loci
+    else:
+        cfg["variant_loci"] = set()
 
     results: dict[int, tuple] = {}
     try:
@@ -353,6 +414,12 @@ def extract_errors_parallel(
         quality_by_depth_all = Counter()
         total_by_depth_all = Counter()
         weighted_quality: dict[int, float] = defaultdict(float)
+        rate_qual_errors_all = Counter()
+        rate_depth_errors_all = Counter()
+        rate_qual_bases_all = Counter()
+        rate_depth_bases_all = Counter()
+        rate_joint_errors_all = Counter()
+        rate_joint_bases_all = Counter()
         n_all = n_err = n_var = 0
         for out_path, kind in ((errors_csv, 5), (variants_csv, 6)):
             with open(out_path, "w", newline="") as out:
@@ -363,47 +430,86 @@ def extract_errors_parallel(
                         shutil.copyfileobj(src, out, 1 << 20)
                     part.unlink()
         for idx in sorted(results):
-            (_, a, e, v, h, _, _, depth_counts, mapq_counts, quality_weights, window_quality_by_depth, window_total_by_depth) = results[idx]
+            (
+                _, a, e, v, h, _, _, depth_counts, mapq_counts,
+                quality_weights, window_quality_by_depth, window_total_by_depth,
+                window_rate_qual_errors, window_rate_depth_errors,
+                window_rate_qual_bases, window_rate_depth_bases,
+                window_rate_joint_errors, window_rate_joint_bases,
+            ) = results[idx]
             n_all += a; n_err += e; n_var += v
             hist.update(h)
             depth_hist.update(depth_counts)
             mapq_hist.update(mapq_counts)
             quality_by_depth_all.update(window_quality_by_depth)
             total_by_depth_all.update(window_total_by_depth)
+            rate_qual_errors_all.update(window_rate_qual_errors)
+            rate_depth_errors_all.update(window_rate_depth_errors)
+            rate_qual_bases_all.update(window_rate_qual_bases)
+            rate_depth_bases_all.update(window_rate_depth_bases)
+            rate_joint_errors_all.update(window_rate_joint_errors)
+            rate_joint_bases_all.update(window_rate_joint_bases)
             
             for q, weight in quality_weights.items():
                 weighted_quality[q] += weight
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    distribution = {}
-
-    for (depth_bin, quality_bin), count in quality_by_depth_all.items():
-
-        distribution[(depth_bin, quality_bin)] = (count / total_by_depth_all[depth_bin])
-
-    #print(distribution)
-       
     if apply_qc:
-        from .mismatch_classify import (
-            #plot_error_histograms_from_counts,
-            plot_quality_depth_heatmap_from_counts,
+        if sum(quality_by_depth_all.values()) != n_err:
+            raise RuntimeError("Quality-depth counts disagree with filtered error count")
+        if sum(total_by_depth_all.values()) != n_err:
+            raise RuntimeError("Depth counts disagree with filtered error count")
+    if compute_error_rates:
+        if sum(rate_qual_errors_all.values()) != sum(rate_depth_errors_all.values()):
+            raise RuntimeError("Rate error numerators disagree")
+        if sum(rate_qual_bases_all.values()) != sum(rate_depth_bases_all.values()):
+            raise RuntimeError("Rate denominators disagree")
+        if sum(rate_joint_errors_all.values()) != sum(rate_qual_errors_all.values()):
+            raise RuntimeError("Joint error numerators disagree")
+        if sum(rate_joint_bases_all.values()) != sum(rate_qual_bases_all.values()):
+            raise RuntimeError("Joint rate denominators disagree")
+
+    distribution = {
+        (d, q): count / total_by_depth_all[d]
+        for (d, q), count in quality_by_depth_all.items()
+    } if apply_qc else None
+       
+    written_rate_plots = None
+    if compute_error_rates:
+        from .plots import plot_error_rates
+        # Each denominator includes reference positions without mismatches.
+        written_rate_plots = plot_error_rates(
+            label=technology,
+            error_hist=rate_qual_errors_all,
+            total_qual=rate_qual_bases_all,
+            error_depth=rate_depth_errors_all,
+            total_depth_bases=rate_depth_bases_all,
+            out_dir=Path(histograms_dir) / technology,
         )
-        """
-        plot_error_histograms_from_counts(
-            hist, depth_hist, mapq_hist, dict(weighted_quality),
-            technology, histograms_dir,
-        )
-        """
-        plot_quality_depth_heatmap_from_counts(
-            quality_by_depth_all,
-            total_by_depth_all,
+
+    # A true error-rate heatmap requires denominators across ALL eligible bases.
+    # With --qc only, those denominators do not exist, so do not draw the old
+    # conditional quality distribution under the same filename.
+    if compute_error_rates:
+        from .plots import plot_quality_depth_heatmap_from_counts
+        heatmap_path = plot_quality_depth_heatmap_from_counts(
+            rate_joint_errors_all,
+            rate_joint_bases_all,
             technology,
             histograms_dir,
         )
+        if heatmap_path is not None:
+            written_rate_plots.extend([
+                heatmap_path.parent / "error_rate_by_quality_depth.csv",
+                heatmap_path,
+            ])
 
-    return ExtractionResult(n_all, n_err, n_var, hist, errors_csv, variants_csv, weighted_error_hist=(dict(weighted_quality) if apply_qc else None),
-        quality_depth_distribution=(distribution if apply_qc else None),
+    return ExtractionResult(
+        n_all, n_err, n_var, hist, errors_csv, variants_csv,
+        weighted_error_hist=(dict(weighted_quality) if apply_qc else None),
+        rate_plots=written_rate_plots,
+        quality_depth_distribution=distribution,
     )
 
 
@@ -418,7 +524,7 @@ def iter_mismatches_parallel(
     bam_path: str | Path,
     technology: str,
     reference_fasta: Optional[str | Path] = None,
-    min_mapq: int = 0,
+    min_mapq: int = 20,
     min_base_qual: int = 0,
     threads: int = 1,
     window_size: int = 5_000_000,
@@ -439,3 +545,4 @@ def iter_mismatches_parallel(
                   initargs=(cfg,)) as pool:
         for chunk in pool.imap(_collect_window, windows):   # ordered
             yield from chunk
+

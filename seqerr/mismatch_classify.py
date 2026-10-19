@@ -7,13 +7,13 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from functools import lru_cache
-from pathlib import Path
 from typing import Iterable
 import re
 
 import pysam
 
 from .bam_reader import Mismatch, _min_mapq_ok
+from .plots import plot_error_histograms
 
 
 @lru_cache(maxsize=100_000)
@@ -54,7 +54,7 @@ def calculate_depth(
     bam_path: str,
     interesting_positions: set[tuple[str, int]],
     min_alignment_fraction: float = 0.8,
-    min_mapq: int = 0,
+    min_mapq: int = 20,
 ) -> dict[tuple[str, int], int]:
     """Count eligible read observations only at requested 1-based positions.
 
@@ -93,6 +93,8 @@ def calculate_depth(
                     if pileup_read.is_del or pileup_read.is_refskip:
                         continue
                     read = pileup_read.alignment
+                    if read.query_sequence is None or read.query_qualities is None:
+                        continue
                     if not _min_mapq_ok(read, min_mapq):
                         continue
                     if calculate_alignment_fraction(read.cigarstring or "") < min_alignment_fraction:
@@ -101,6 +103,89 @@ def calculate_depth(
                 depth[(chrom, pos)] = coverage
 
     return depth
+
+
+def count_rate_denominators(
+    bam: pysam.AlignmentFile,
+    fasta: pysam.FastaFile | None,
+    chrom: str,
+    start: int,
+    end: int,
+    variant_loci: set[tuple[str, int]],
+    min_mapq: int = 20,
+    min_alignment_fraction: float = 0.8,
+    min_depth: int = 10,
+    min_base_qual: int = 0,
+    depth_bin_size: int = 5,
+    quality_bin_size: int = 5,
+) -> tuple[Counter, Counter, Counter]:
+    """Count eligible bases for real error rates across ALL reference positions.
+
+    A region [start,end) is owned by exactly one worker, even when reads
+    overlap window boundaries. VCF loci and non-ACGT reference loci are masked.
+
+    Returns (bases_by_phred, bases_by_filtered_depth, bases_by_depth_and_phred_bin).
+    All three are denominator counts, NOT error counts.
+    Depth is evaluated before the min_base_qual threshold, consistent with
+    calculate_depth(), while denominators count only quality-eligible bases.
+    """
+    if fasta is None:
+        raise ValueError("count_rate_denominators requires an indexed FASTA")
+    if depth_bin_size <= 0 or quality_bin_size <= 0:
+        raise ValueError("Bin sizes must be positive")
+    if start >= end:
+        return Counter(), Counter(), Counter()
+    reference = fasta.fetch(chrom, start, end).upper()
+    quality_totals: Counter = Counter()
+    depth_base_totals: Counter = Counter()
+    quality_depth_base_totals: Counter = Counter()
+
+    for column in bam.pileup(
+        chrom, start, end,
+        truncate=True,
+        stepper="nofilter",
+        min_base_quality=0,
+        min_mapping_quality=0,
+        ignore_overlaps=False,
+        max_depth=100_000,
+    ):
+        ref0 = column.reference_pos
+        pos1 = ref0 + 1
+        if (chrom, pos1) in variant_loci:
+            continue
+        if reference[ref0 - start] not in "ACGT":
+            continue
+
+        depth = 0
+        eligible_qualities: list[int] = []
+        for pileup_read in column.pileups:
+            if pileup_read.is_del or pileup_read.is_refskip:
+                continue
+            read = pileup_read.alignment
+            if read.query_sequence is None or read.query_qualities is None:
+                continue
+            if not _min_mapq_ok(read, min_mapq):
+                continue
+            if calculate_alignment_fraction(read.cigarstring or "") < min_alignment_fraction:
+                continue
+            qpos = pileup_read.query_position
+            if qpos is None:
+                continue
+            depth += 1
+            qual = int(read.query_qualities[qpos])
+            if qual >= min_base_qual:
+                eligible_qualities.append(qual)
+
+        if depth < min_depth:
+            continue
+        depth_bin = (depth // depth_bin_size) * depth_bin_size
+        for qual in eligible_qualities:
+            quality_totals[qual] += 1
+            qual_bin = (qual // quality_bin_size) * quality_bin_size
+            quality_depth_base_totals[(depth_bin, qual_bin)] += 1
+        depth_base_totals[depth] += len(eligible_qualities)
+
+    return quality_totals, depth_base_totals, quality_depth_base_totals
 
 
 def filter_mismatches_by_qc(
@@ -119,126 +204,6 @@ def filter_mismatches_by_qc(
     return filtered
 
 
-def _save_count_plot(
-    counts: dict[int, int | float] | Counter,
-    title: str,
-    xlabel: str,
-    ylabel: str,
-    filepath: Path,
-) -> None:
-    if not counts:
-        return
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    x = sorted(counts)
-    y = [counts[k] for k in x]
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(x, y, width=0.9, edgecolor="black", linewidth=0.3)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(filepath, dpi=150)
-    plt.close(fig)
-
-
-def plot_error_histograms_from_counts(
-    base_qual_counts: Counter,
-    depth_counts: Counter,
-    mapq_counts: Counter,
-    weighted_quality_counts: dict[int, float],
-    technology: str,
-    output_dir: str = "histograms",
-) -> None:
-    """Plots from aggregated counts: safe to use after multiprocessing."""
-    output_path = Path(output_dir) / technology
-    output_path.mkdir(parents=True, exist_ok=True)
-    datasets = [
-        (depth_counts, "Depth", "Number of errors", "depth_errors_histogram.png"),
-        (base_qual_counts, "Base quality (Phred)", "Number of errors", "base_qual_errors_histogram.png"),
-        (mapq_counts, "Mapping quality (MAPQ)", "Number of errors", "mapping_qual_errors_histogram.png"),
-        (
-            weighted_quality_counts,
-            "Base quality (Phred)",
-            "Sum of 1 / depth (coverage-weighted errors)",
-            "base_qual_depth_weighted_histogram.png",
-        ),
-    ]
-    for counts, xlabel, ylabel, filename in datasets:
-        _save_count_plot(counts, f"{technology.upper()} errors: {xlabel}", xlabel, ylabel, output_path / filename)
-
-"""
-def plot_error_histograms(
-    errors: list[Mismatch],
-    technology: str,
-    output_dir: str = "histograms",
-) -> None:
-    
-    qual = Counter(m.base_qual for m in errors)
-    depths = Counter(m.depth for m in errors)
-    mapq = Counter(m.mapping_qual for m in errors)
-    weighted: dict[int, float] = defaultdict(float)
-    
-    for m in errors:
-        if m.depth > 0:
-            weighted[m.base_qual] += 1.0 / m.depth
-    plot_error_histograms_from_counts(qual, depths, mapq, dict(weighted), technology, output_dir)
-"""
-def plot_quality_depth_heatmap_from_counts(
-    quality_by_depth_counts: Counter,
-    total_by_depth_counts: Counter,
-    technology: str,
-    output_dir: str = "histograms",
-) -> None:
-    if not quality_by_depth_counts or not total_by_depth_counts:
-        return
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    output_path = Path(output_dir) / technology
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    depth_bins = sorted(total_by_depth_counts.keys())
-    quality_bins = sorted({quality_bin for (_, quality_bin) in quality_by_depth_counts.keys()})
-
-    matrix = np.zeros((len(quality_bins), len(depth_bins)))
-
-    for row, quality_bin in enumerate(quality_bins):
-        for col, depth_bin in enumerate(depth_bins):
-            count = quality_by_depth_counts.get((depth_bin, quality_bin), 0)
-            total = total_by_depth_counts.get(depth_bin, 0)
-
-            if total > 0:
-                matrix[row, col] = count / total
-            else:
-                matrix[row, col] = 0.0
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(matrix, aspect="auto", origin="lower")
-
-    ax.set_xticks(range(len(depth_bins)))
-    ax.set_xticklabels(depth_bins, rotation=45, ha="right")
-
-    ax.set_yticks(range(len(quality_bins)))
-    ax.set_yticklabels(quality_bins)
-
-    ax.set_xlabel("Depth bin")
-    ax.set_ylabel("Base quality bin")
-    ax.set_title(f"{technology.upper()} error distribution: base quality vs depth")
-
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Proportion of errors")
-
-    fig.tight_layout()
-    fig.savefig(output_path / "base_quality_vs_depth_heatmap.png", dpi=150)
-    plt.close(fig)
-
-
 
 def process_technology(
     mismatches: Iterable[Mismatch],
@@ -247,10 +212,7 @@ def process_technology(
     min_alignment_fraction: float = 0.8,
     min_depth: int = 10,
     *,
-    min_mapq: int = 0,
-    plot_histograms: bool = True,
-    technology: str | None = None,
-    output_dir: str = "histograms",
+    min_mapq: int = 20,
 ) -> tuple[list[Mismatch], list[Mismatch]]:
     """Classify & QC errors; keep VCF variants without minimum-depth filtering.
 
@@ -269,6 +231,18 @@ def process_technology(
     for mismatch in errors:
         mismatch.depth = depth.get((mismatch.chrom, mismatch.ref_pos), 0)
 
-    errors = filter_mismatches_by_qc(errors,depth,min_alignment_fraction=min_alignment_fraction,min_depth=min_depth,)
+    errors = filter_mismatches_by_qc(
+        errors,
+        depth,
+        min_alignment_fraction=min_alignment_fraction,
+        min_depth=min_depth,
+    )
 
+    # Variants outside the error positions have no calculated depth.
+    # Filtering them with min_depth would incorrectly remove valid variants.
+    
     return errors, variants
+
+
+
+
