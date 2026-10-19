@@ -62,6 +62,11 @@ def test_run_all_end_to_end(tmp_path):
 
     assert (out_dir / "comparison_summary.txt").exists()
     assert (out_dir / "illumina" / "errors.csv").exists()
+    assert all(path.exists() for path in (
+        out_dir / "illumina" / "calibration.csv",
+        out_dir / "bgi" / "calibration.csv",
+        out_dir / "calibration.png",
+    ))
 
     with pysam.AlignmentFile(str(a.bam_path)) as bam:
         recs = list(bam)
